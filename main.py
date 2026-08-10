@@ -101,21 +101,32 @@ def _setup_exception_handler(logger: logging.Logger) -> None:
     sys.excepthook = handle_exception
 
 
-def _run_startup_diagnostics(logger: logging.Logger) -> None:
-    """起動時に依存ツールの存在を確認する。"""
+def _run_startup_diagnostics(logger: logging.Logger) -> list[str]:
+    """起動時に依存ツールの存在を確認する。
+
+    Returns:
+        未検出の「必須」ツール名のリスト。オプション扱いのツールは含めない。
+        呼び出し側はこれをGUIに渡し、ユーザーへ警告を表示する。
+    """
     import shutil
-    
+
+    # (説明, 必須かどうか)
     tools = {
-        "ffmpeg": "動画/音声の変換に必要",
-        "node": "高画質ダウンロードに推奨（オプション）"
+        "ffmpeg": ("動画/音声の変換に必要", True),
+        "node": ("高画質ダウンロードに推奨（オプション）", False),
     }
-    
-    for tool, description in tools.items():
+
+    missing_required: list[str] = []
+    for tool, (description, required) in tools.items():
         path = shutil.which(tool)
         if path:
             logger.info(f"依存ツール検出: {tool} -> {path}")
         else:
             logger.warning(f"依存ツール未検出: {tool} ({description})")
+            if required:
+                missing_required.append(tool)
+
+    return missing_required
 
 
 def main() -> None:
@@ -134,13 +145,13 @@ def main() -> None:
     _setup_exception_handler(logger)
     
     # 4. 起動診断
-    _run_startup_diagnostics(logger)
-    
+    missing_tools = _run_startup_diagnostics(logger)
+
     # 5. GUIの起動
     try:
         from qt_app import run as run_gui
         logger.info("Starting GUI...")
-        run_gui()
+        run_gui(missing_tools=missing_tools)
     except Exception as e:
         logger.critical(f"GUI起動に失敗しました: {e}", exc_info=True)
         raise

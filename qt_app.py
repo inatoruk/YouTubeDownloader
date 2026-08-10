@@ -422,10 +422,19 @@ class MainWindow(QMainWindow):
     def _start_batch_download(self):
         """バッチダウンロードを開始するUI更新を行う。"""
         base_req = self._build_base_request()
+        resolving = self._batch_manager.resolving_count
+
         self.download_btn.setEnabled(False)
         self.download_btn.setText("ダウンロード中...")
         self.stop_btn.setVisible(True)
-        self.progress_panel.set_status("ダウンロード中...")
+        # タイトル取得が終わっていないアイテムがある場合は、その旨を伝える。
+        # 取得完了後に自動でダウンロードが始まる。
+        if resolving > 0:
+            self.progress_panel.set_status(
+                f"動画情報を取得中... ({resolving}件) 完了後に自動で開始します"
+            )
+        else:
+            self.progress_panel.set_status("ダウンロード中...")
         self._batch_manager.start_all(base_req)
 
     def _on_start_batch(self):
@@ -546,12 +555,48 @@ class MainWindow(QMainWindow):
 # エントリーポイント
 # =============================================================================
 
-def run():
+# 依存ツールのインストール方法（警告ダイアログで案内する）
+_TOOL_INSTALL_HINTS = {
+    "ffmpeg": "brew install ffmpeg",
+}
+
+
+def _warn_missing_tools(parent, missing_tools: list[str]) -> None:
+    """必須の外部ツールが未検出の場合に警告ダイアログを表示する。
+
+    ffmpeg が無いと音声変換も映像・音声のマージも失敗するため、
+    ログだけでなくユーザーに直接伝える。
+    """
+    if not missing_tools:
+        return
+
+    names = "、".join(missing_tools)
+    hints = "\n".join(
+        f"    {tool}:  {_TOOL_INSTALL_HINTS.get(tool, '（README を参照してください）')}"
+        for tool in missing_tools
+    )
+    logger.warning("必須ツール未検出をユーザーに通知します: %s", names)
+
+    msg_box = QMessageBox(parent)
+    msg_box.setWindowTitle("必要なツールが見つかりません")
+    msg_box.setIcon(QMessageBox.Warning)
+    msg_box.setText(f"{names} が見つかりませんでした。")
+    msg_box.setInformativeText(
+        "このままではダウンロードや音声変換に失敗します。\n"
+        "ターミナルで以下を実行し、アプリを再起動してください:\n\n"
+        f"{hints}"
+    )
+    msg_box.setStyleSheet("QLabel { min-width: 420px; }")
+    msg_box.setStandardButtons(QMessageBox.Ok)
+    msg_box.exec()
+
+
+def run(missing_tools: Optional[list[str]] = None):
     # macOS標準ダイアログを日本語化するため、Cocoaの言語設定引数を追加
     argv = sys.argv.copy()
     if "-AppleLanguages" not in argv:
         argv.extend(["-AppleLanguages", "(ja)"])
-        
+
     app = QApplication(argv)
 
     # Qt標準ダイアログ（ファイル選択等）の日本語化
@@ -564,6 +609,10 @@ def run():
     _update_worker = _YtDlpUpdateWorker(window)
     _update_worker.start()
     window.show()
+
+    # ウィンドウ表示後に警告を出す（ダイアログが前面に来るように）
+    _warn_missing_tools(window, missing_tools or [])
+
     sys.exit(app.exec())
 
 

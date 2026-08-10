@@ -197,11 +197,15 @@ class UrlInputPanel(QFrame):
     bulk_urls_submitted = Signal(list)
     status_message = Signal(str, bool)
 
+    # モバイル (m.) や YouTube Music (music.) のサブドメインも受け付ける。
+    # iPhoneの共有メニューから貼り付けたURLは m.youtube.com になるため。
+    _SUBDOMAIN = r'(www\.|m\.|music\.)?'
     _YOUTUBE_PATTERN = re.compile(
-        r'^(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+'
+        rf'^(https?://)?{_SUBDOMAIN}(youtube\.com|youtu\.be)/.+'
     )
     _CHANNEL_PATTERN = re.compile(
-        r'^(https?://)?(www\.)?youtube\.com/(@[\w.-]+|channel/[\w-]+|c/[\w.-]+|user/[\w.-]+)(/.*)?$'
+        rf'^(https?://)?{_SUBDOMAIN}youtube\.com/'
+        r'(@[\w.-]+|channel/[\w-]+|c/[\w.-]+|user/[\w.-]+)(/.*)?$'
     )
 
     def __init__(self, parent=None):

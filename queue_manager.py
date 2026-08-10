@@ -204,6 +204,16 @@ class BatchDownloadManager(QObject):
             if item.status in (ItemStatus.PENDING, ItemStatus.RESOLVING)
         )
 
+    @property
+    def resolving_count(self) -> int:
+        """タイトル取得中（RESOLVING）のアイテム数。
+
+        この数が0になるまでバッチは「完了」とみなさない。
+        追加直後（情報取得中）に開始した場合、ディスパッチ対象が
+        まだ存在しないだけで、待てば流れ始めるため。
+        """
+        return sum(1 for item in self._items if item.status == ItemStatus.RESOLVING)
+
     # --- キュー操作 ---
 
     def find_item_by_id(self, item_id: str) -> Optional[DownloadItem]:
@@ -364,10 +374,19 @@ class BatchDownloadManager(QObject):
         worker.start()
 
     def _cleanup_info_worker(self, item_id: str) -> None:
-        """情報取得ワーカーをクリーンアップする。"""
+        """情報取得ワーカーをクリーンアップする。
+
+        バッチ実行中にタイトル取得が完了した場合、この時点でアイテムは
+        RESOLVING から PENDING に遷移済みなので、ここでディスパッチを促す。
+        （info_fetched/info_failed はこのスロットより先に配送される）
+        アイテムが途中で削除されていた場合も、ここを通ることで
+        「RESOLVING待ちのまま止まる」状態を防げる。
+        """
         worker = self._info_workers.pop(item_id, None)
         if worker:
             worker.deleteLater()
+        if self._is_running:
+            self._dispatch_next()
 
     @Slot(str, dict)
     def _on_info_fetched(self, item_id: str, info: dict) -> None:
@@ -410,6 +429,12 @@ class BatchDownloadManager(QObject):
             if next_item is None:
                 break
             self._start_download(next_item.id)
+
+        # タイトル取得中のアイテムが残っている間は「完了」と判定しない。
+        # 情報取得が終われば PENDING に遷移し、_cleanup_info_worker から
+        # 再度 _dispatch_next が呼ばれてダウンロードが始まる。
+        if self.resolving_count > 0:
+            return
 
         # 全ワーカーが終了していてペンディングもない場合、完了通知
         if not self._active_workers and self._find_next_pending() is None:
