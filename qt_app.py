@@ -56,6 +56,10 @@ class MainWindow(QMainWindow):
     ここではパネル同士とBatchDownloadManagerの接続（オーケストレーション）のみ行う。
     """
 
+    # コンテンツ列の最大幅。全画面表示でカードが横に間延びしないよう、
+    # これ以上は広げずに中央寄せする。
+    MAX_CONTENT_WIDTH = 900
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("YouTube Downloader")
@@ -101,7 +105,13 @@ class MainWindow(QMainWindow):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        # ウィンドウを広げてもコンテンツは MAX_CONTENT_WIDTH で頭打ちにし、
+        # 余った横幅は左右の余白として中央に寄せる。
+        # （setWidgetResizable(True) はウィジェットの最大幅制約を尊重する）
+        scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+
         content = QWidget()
+        content.setMaximumWidth(self.MAX_CONTENT_WIDTH)
         scroll.setWidget(content)
 
         layout = QVBoxLayout(content)
