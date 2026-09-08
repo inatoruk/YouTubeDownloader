@@ -119,6 +119,15 @@ class DownloadError(Exception):
     """ダウンロード処理中の例外。"""
 
 
+class DownloadCancelled(Exception):
+    """ユーザー操作によるキャンセル。
+
+    通常の失敗と違いリトライしてはならない。以前はキャンセルが
+    汎用の Exception として送出され、リトライループに飲み込まれた結果、
+    停止ボタンを押しても再ダウンロードが2回走っていた。
+    """
+
+
 class Downloader:
     """yt-dlpを用いたダウンロード処理ラッパー。"""
 
@@ -161,19 +170,35 @@ class Downloader:
         self,
         request: DownloadRequest,
         progress_hooks: Optional[Sequence[ProgressCallback]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> str:
         """ダウンロード処理を実行する。
-        
+
+        Args:
+            is_cancelled: キャンセル要求の有無を返す関数。yt-dlp が内部で
+                例外を包み替えても確実にキャンセルを検出できるよう、
+                例外型だけに頼らずこの関数でも判定する。
+
         Returns:
             ダウンロードしたファイルのパス
+
+        Raises:
+            DownloadCancelled: ユーザーがキャンセルした場合（リトライしない）
+            DownloadError: ダウンロードに失敗した場合
         """
         output_dir = Path(request.output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         ydl_opts = self._build_options(request, progress_hooks)
 
+        def cancelled() -> bool:
+            return is_cancelled is not None and is_cancelled()
+
         last_error: Optional[Exception] = None
         for attempt in range(1, self._max_retries + 1):
+            # リトライ前に毎回チェックし、キャンセル後の再ダウンロードを防ぐ
+            if cancelled():
+                raise DownloadCancelled("キャンセルされました")
             try:
                 self._logger.info(
                     "Start download (attempt %s/%s): url=%s", attempt, self._max_retries, request.url
@@ -192,7 +217,14 @@ class Downloader:
                         self._logger.info("Download completed: %s", final_path)
                         return str(final_path)
                 raise DownloadError(f"ダウンロード情報の取得に失敗しました: {request.url}")
+            except DownloadCancelled:
+                raise
             except Exception as exc:
+                # キャンセル由来の失敗はリトライせず即座に抜ける。
+                # yt-dlp が例外を包み替えても検出できるようフラグでも確認する。
+                if cancelled():
+                    self._logger.info("Download cancelled: %s", request.url)
+                    raise DownloadCancelled("キャンセルされました") from exc
                 last_error = exc
                 self._logger.warning("Download failed (attempt %s): %s", attempt, exc)
                 # 403やdeleted等、再試行しても結果が変わらない失敗は即座に諦める。

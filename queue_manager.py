@@ -17,7 +17,7 @@ from typing import Optional, Sequence
 
 from PySide6.QtCore import QObject, Signal, Slot, QThread
 
-from downloader import DownloadRequest, Downloader
+from downloader import DownloadCancelled, DownloadRequest, Downloader
 
 logger = logging.getLogger(__name__)
 
@@ -101,17 +101,21 @@ class _SingleWorker(QThread):
 
             def progress_hook(d):
                 if self._cancelled:
-                    raise Exception("キャンセルされました")
+                    # 専用例外にすることでリトライループに飲まれない
+                    raise DownloadCancelled("キャンセルされました")
                 self.progress.emit(self.item_id, d)
 
             filepath = self._downloader.download(
                 request=self.request,
                 progress_hooks=[progress_hook],
+                is_cancelled=lambda: self._cancelled,
             )
             if self._cancelled:
                 self.finished_item.emit(self.item_id, False, "キャンセルされました")
             else:
                 self.finished_item.emit(self.item_id, True, filepath or "ダウンロード完了")
+        except DownloadCancelled:
+            self.finished_item.emit(self.item_id, False, "キャンセルされました")
         except Exception as e:
             if self._cancelled:
                 self.finished_item.emit(self.item_id, False, "キャンセルされました")
@@ -164,12 +168,18 @@ class BatchDownloadManager(QObject):
     all_finished = Signal(int, int)            # (success_count, fail_count)
     queue_changed = Signal()                   # キュー内容が変化した
 
+    # タイトル取得の同時実行数。チャンネル展開で数百件が一度に入っても
+    # スレッドとネットワーク接続が爆発しないよう上限を設ける。
+    MAX_INFO_WORKERS = 4
+
     def __init__(self, max_concurrent: int = 2, parent=None):
         super().__init__(parent)
         self._items: list[DownloadItem] = []
         self._max_concurrent = max(1, max_concurrent)
         self._active_workers: dict[str, _SingleWorker] = {}   # item_id -> worker
         self._info_workers: dict[str, _InfoWorker] = {}        # item_id -> worker
+        # 取得待ちの (item_id, url)。MAX_INFO_WORKERS を超えた分はここで待機する
+        self._info_queue: list[tuple[str, str]] = []
         # 複数プレイリストの同時展開に対応するためリストで管理（#3修正）
         self._playlist_workers: list[_PlaylistExpandWorker] = []
         self._is_running = False
@@ -278,10 +288,14 @@ class BatchDownloadManager(QObject):
             return
         if item.status == ItemStatus.DOWNLOADING and item_id in self._active_workers:
             self._cancel_worker(item_id)
-            
+
+        # タイトル取得の待機列からも除去する（起動済みのものは
+        # _pump_info_queue 側でアイテム不在としてスキップされる）
+        self._info_queue = [q for q in self._info_queue if q[0] != item_id]
+
         # リストから完全に削除する
         self._items = [i for i in self._items if i.id != item_id]
-        
+
         self.item_status_changed.emit(item_id, ItemStatus.CANCELLED.value)
         self.queue_changed.emit()
 
@@ -296,6 +310,7 @@ class BatchDownloadManager(QObject):
     def clear_all(self) -> None:
         """全てのアイテムをキューから除去する。ダウンロード中のものがあれば停止する。"""
         self.stop_all()
+        self._info_queue.clear()
         self._items.clear()
         self.queue_changed.emit()
 
@@ -357,21 +372,44 @@ class BatchDownloadManager(QObject):
     # --- 内部メソッド ---
 
     def _start_info_fetch(self, item_id: str, url: str) -> None:
-        """バックグラウンドで動画タイトルを取得する。"""
+        """タイトル取得を予約する。
+
+        実際の起動は _pump_info_queue が MAX_INFO_WORKERS の範囲で行う。
+        以前はURL1件ごとに無制限にスレッドを起動しており、チャンネル展開で
+        数百件が入るとスレッドと同時接続が爆発していた。
+        """
         if item_id in self._info_workers:
+            return
+        if any(queued_id == item_id for queued_id, _ in self._info_queue):
             return
         item = self.find_item_by_id(item_id)
         if item is None:
             return
+
+        # 待機中もRESOLVING扱いにしておくことで、取得完了前に
+        # バッチが「完了」と誤判定されるのを防ぐ
         item.status = ItemStatus.RESOLVING
         self.item_status_changed.emit(item_id, ItemStatus.RESOLVING.value)
 
-        worker = _InfoWorker(item_id, url, self)
-        worker.info_fetched.connect(self._on_info_fetched)
-        worker.info_failed.connect(self._on_info_failed)
-        worker.finished.connect(lambda: self._cleanup_info_worker(item_id))
-        self._info_workers[item_id] = worker
-        worker.start()
+        self._info_queue.append((item_id, url))
+        self._pump_info_queue()
+
+    def _pump_info_queue(self) -> None:
+        """上限に達するまで、待機中のタイトル取得を開始する。"""
+        while self._info_queue and len(self._info_workers) < self.MAX_INFO_WORKERS:
+            item_id, url = self._info_queue.pop(0)
+            # 待機中に削除されたアイテムはスキップ
+            if self.find_item_by_id(item_id) is None:
+                continue
+            if item_id in self._info_workers:
+                continue
+
+            worker = _InfoWorker(item_id, url, self)
+            worker.info_fetched.connect(self._on_info_fetched)
+            worker.info_failed.connect(self._on_info_failed)
+            worker.finished.connect(lambda wid=item_id: self._cleanup_info_worker(wid))
+            self._info_workers[item_id] = worker
+            worker.start()
 
     def _cleanup_info_worker(self, item_id: str) -> None:
         """情報取得ワーカーをクリーンアップする。
@@ -385,6 +423,8 @@ class BatchDownloadManager(QObject):
         worker = self._info_workers.pop(item_id, None)
         if worker:
             worker.deleteLater()
+        # 空いた枠で待機中の取得を開始する
+        self._pump_info_queue()
         if self._is_running:
             self._dispatch_next()
 
