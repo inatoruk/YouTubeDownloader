@@ -4,16 +4,103 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 import yt_dlp
 
 ProgressCallback = Callable[[dict], None]
+
+# yt-dlp がこの日数より古い場合、YouTube の仕様変更に追随できず
+# ダウンロードが 403 等で失敗する可能性が高いとみなす。
+STALE_AFTER_DAYS = 45
+
+
+def yt_dlp_version() -> str:
+    """実際にロードされている yt-dlp のバージョン文字列を返す。"""
+    return getattr(yt_dlp.version, "__version__", "unknown")
+
+
+def yt_dlp_age_days() -> Optional[int]:
+    """yt-dlp のリリース日からの経過日数を返す。
+
+    yt-dlp のバージョンは "2026.08.19" のような日付形式なので、
+    そこから古さを判定できる。解釈できない場合は None。
+    """
+    match = re.match(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})", yt_dlp_version())
+    if not match:
+        return None
+    try:
+        released = date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+    return (date.today() - released).days
+
+
+def is_yt_dlp_stale() -> bool:
+    """yt-dlp が古く、ダウンロード失敗の原因になりうるかを判定する。"""
+    age = yt_dlp_age_days()
+    return age is not None and age > STALE_AFTER_DAYS
+
+
+# リトライしても結果が変わらない（恒久的な）失敗のパターン。
+# これらに一致した場合は即座に諦め、無駄な再試行で時間を浪費しない。
+_PERMANENT_ERROR_PATTERNS = (
+    "403",
+    "forbidden",
+    "video unavailable",
+    "private video",
+    "members-only",
+    "members only",
+    "removed by the uploader",
+    "account associated with this video has been terminated",
+    "sign in to confirm your age",
+    "is not available in your country",
+    "this live event will begin",
+)
+
+
+def is_permanent_error(message: str) -> bool:
+    """再試行しても回復しないエラーかどうかを判定する。"""
+    low = message.lower()
+    return any(pattern in low for pattern in _PERMANENT_ERROR_PATTERNS)
+
+
+def describe_error(message: str) -> str:
+    """yt-dlp の生エラーを、次に何をすべきか分かる日本語に変換する。"""
+    low = message.lower()
+    if "403" in message or "forbidden" in low:
+        hint = "YouTubeにアクセスを拒否されました (403)。"
+        if is_yt_dlp_stale():
+            age = yt_dlp_age_days()
+            hint += (
+                f" ダウンロードエンジン(yt-dlp {yt_dlp_version()})が"
+                f"{age}日前のもので古いことが原因の可能性が高いです。更新してください。"
+            )
+        else:
+            hint += " 時間をおいて再試行してください。"
+        return hint
+    if "video unavailable" in low or "removed by the uploader" in low:
+        return "この動画は削除されたか非公開です。"
+    if "private video" in low:
+        return "非公開動画のためダウンロードできません。"
+    if "members-only" in low or "members only" in low:
+        return "メンバー限定動画のためダウンロードできません。"
+    if "sign in to confirm your age" in low:
+        return "年齢確認が必要な動画のためダウンロードできません。"
+    if "is not available in your country" in low:
+        return "お住まいの地域では視聴できない動画です。"
+    if "ffmpeg" in low:
+        return "ffmpegの処理に失敗しました。`brew install ffmpeg` で導入・更新してください。"
+    if "timed out" in low or "timeout" in low or "connection" in low:
+        return "ネットワークエラーが発生しました。接続を確認してください。"
+    return message
 
 
 @dataclass
@@ -108,12 +195,19 @@ class Downloader:
             except Exception as exc:
                 last_error = exc
                 self._logger.warning("Download failed (attempt %s): %s", attempt, exc)
+                # 403やdeleted等、再試行しても結果が変わらない失敗は即座に諦める。
+                # （以前はここで無駄に3回リトライしていた）
+                if is_permanent_error(str(exc)):
+                    self._logger.info(
+                        "Permanent error detected, skipping retries: %s", exc
+                    )
+                    break
                 if attempt < self._max_retries:
                     sleep_seconds = min(5, attempt)
                     self._logger.info("Retrying in %s seconds", sleep_seconds)
                     time.sleep(sleep_seconds)
 
-        raise DownloadError(f"ダウンロードに失敗しました: {request.url}") from last_error
+        raise DownloadError(describe_error(str(last_error))) from last_error
 
     def fetch_info(self, url: str) -> Optional[dict]:
         """動画の情報をダウンロードせずに取得する。
@@ -238,27 +332,54 @@ class Downloader:
         return urls
 
     def _ensure_updated(self) -> None:
-        # Frozenアプリの場合は自分自身を更新できないためスキップ
-        # sys.executableがpythonインタープリタではなくアプリ実行ファイルになるため
-        if getattr(sys, 'frozen', False):
-            self._logger.info("Skipping yt-dlp update in frozen environment")
-            return
+        """yt-dlp を最新化する（プロセスにつき1回だけ実行）。
 
+        yt-dlp は YouTube の仕様変更に追随するため頻繁に更新される。
+        古いままだとダウンロードが 403 等で失敗するため、ここで更新を試みる。
+        """
         if not self._auto_update or Downloader._global_update_checked:
             return
+        Downloader._global_update_checked = True
 
-        cmd = [sys.executable, "-m", "yt_dlp", "-U"]
+        age = yt_dlp_age_days()
+        self._logger.info(
+            "yt-dlp version: %s (%s日前)", yt_dlp_version(),
+            age if age is not None else "不明",
+        )
+
+        # Frozen (.app) では yt-dlp が PYZ アーカイブに固められているため
+        # 自己更新できない。古い場合は警告を残し、UI側で再ビルドを促す。
+        if getattr(sys, "frozen", False):
+            if is_yt_dlp_stale():
+                self._logger.warning(
+                    "同梱の yt-dlp (%s) が %s日前のものです。"
+                    "YouTubeの仕様変更でダウンロードが失敗する可能性があります。"
+                    "アプリの再ビルドが必要です。",
+                    yt_dlp_version(), age,
+                )
+            else:
+                self._logger.info("Frozen環境のため自己更新はスキップします")
+            return
+
+        # `yt_dlp -U` は単体バイナリ版専用で、pip導入版では動作しない。
+        # そのため pip 経由で更新する。
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
         try:
-            self._logger.info("Checking yt-dlp updates")
-            subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=30)
+            self._logger.info("Checking yt-dlp updates via pip")
+            result = subprocess.run(
+                cmd, check=True, capture_output=True, text=True, timeout=180
+            )
         except subprocess.CalledProcessError as exc:
-            self._logger.warning("yt-dlp update failed: %s", exc)
+            self._logger.warning("yt-dlp update failed: %s", exc.stderr or exc)
         except subprocess.TimeoutExpired:
             self._logger.warning("yt-dlp update timed out")
         else:
-            self._logger.info("yt-dlp update complete")
-        finally:
-            Downloader._global_update_checked = True
+            if "Successfully installed" in (result.stdout or ""):
+                self._logger.info(
+                    "yt-dlp を更新しました。次回起動時から反映されます。"
+                )
+            else:
+                self._logger.info("yt-dlp は最新です (%s)", yt_dlp_version())
 
     def _build_options(
         self,

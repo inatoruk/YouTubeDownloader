@@ -22,7 +22,10 @@ from PySide6.QtGui import (
     QColor, QPalette, QKeySequence, QShortcut, QDesktopServices,
 )
 
-from downloader import DownloadRequest, Downloader
+from downloader import (
+    DownloadRequest, Downloader,
+    is_yt_dlp_stale, yt_dlp_age_days, yt_dlp_version,
+)
 from queue_manager import BatchDownloadManager, DownloadItem, ItemStatus
 from theme import Theme, build_global_stylesheet
 from widgets import UrlInputPanel, QueuePanel, FormatPanel, ProgressPanel
@@ -322,6 +325,9 @@ class MainWindow(QMainWindow):
 
     @Slot(str, bool, str)
     def _on_item_finished(self, item_id: str, success: bool, message: str):
+        # 失敗理由をキュー上に表示する（従来は✕アイコンのみでログを見るしかなかった）
+        if not success and "キャンセル" not in message:
+            self.queue_panel.set_item_error(item_id, message)
         self._sync_ui_state()
 
     @Slot(int, int)
@@ -591,6 +597,38 @@ def _warn_missing_tools(parent, missing_tools: list[str]) -> None:
     msg_box.exec()
 
 
+def _warn_stale_engine(parent) -> None:
+    """同梱の yt-dlp が古い場合に警告する（.app 版のみ）。
+
+    .app では yt-dlp を自己更新できないため、古いまま放置すると
+    YouTubeの仕様変更で 403 が出てダウンロードが全滅する。
+    原因が分からないまま失敗し続けるのを防ぐ。
+    """
+    if not getattr(sys, "frozen", False) or not is_yt_dlp_stale():
+        return
+
+    age = yt_dlp_age_days()
+    logger.warning("同梱yt-dlpが古いためユーザーに通知します: %s", yt_dlp_version())
+
+    msg_box = QMessageBox(parent)
+    msg_box.setWindowTitle("ダウンロードエンジンが古くなっています")
+    msg_box.setIcon(QMessageBox.Warning)
+    msg_box.setText(
+        f"同梱の yt-dlp ({yt_dlp_version()}) は約{age}日前のバージョンです。"
+    )
+    msg_box.setInformativeText(
+        "YouTube側の仕様変更により、ダウンロードが「403 Forbidden」で\n"
+        "失敗する可能性があります。\n\n"
+        "解消するには、プロジェクトフォルダで以下を実行し、\n"
+        "アプリを再ビルドしてください:\n\n"
+        "    .venv/bin/pip install --upgrade yt-dlp\n"
+        "    .venv/bin/pyinstaller YoutubeDownloader.spec --noconfirm"
+    )
+    msg_box.setStyleSheet("QLabel { min-width: 460px; }")
+    msg_box.setStandardButtons(QMessageBox.Ok)
+    msg_box.exec()
+
+
 def run(missing_tools: Optional[list[str]] = None):
     # macOS標準ダイアログを日本語化するため、Cocoaの言語設定引数を追加
     argv = sys.argv.copy()
@@ -612,6 +650,7 @@ def run(missing_tools: Optional[list[str]] = None):
 
     # ウィンドウ表示後に警告を出す（ダイアログが前面に来るように）
     _warn_missing_tools(window, missing_tools or [])
+    _warn_stale_engine(window)
 
     sys.exit(app.exec())
 

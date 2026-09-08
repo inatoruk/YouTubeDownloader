@@ -174,6 +174,20 @@ class QueueItemWidget(QFrame):
         # percentは0〜100で渡されるので0.0〜1.0に正規化する
         self.progress_bar.setProgress(percent / 100.0)
 
+    def set_error(self, message: str):
+        """失敗理由をURL行に表示する。
+
+        従来は✕アイコンが出るだけで、なぜ失敗したのかユーザーが
+        知る手段がログファイルしか無かった。
+        """
+        if not message:
+            return
+        self.url_label.setText(message)
+        self.url_label.setWordWrap(True)
+        self.url_label.setStyleSheet(f"font-size: 11px; color: {Theme.ERROR};")
+        # 全文はツールチップで確認できるようにする
+        self.setToolTip(message)
+
     def update_title(self, title: str):
         self.title_label.setText(title)
 
@@ -324,6 +338,12 @@ class QueuePanel(QFrame):
         widget = self._widgets.get(item_id)
         if widget:
             widget.update_status(status)
+
+    def set_item_error(self, item_id: str, message: str):
+        """アイテムの失敗理由を表示する。"""
+        widget = self._widgets.get(item_id)
+        if widget:
+            widget.set_error(message)
 
     def update_item_title(self, item_id: str, title: str):
         widget = self._widgets.get(item_id)
