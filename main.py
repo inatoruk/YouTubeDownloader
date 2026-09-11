@@ -113,7 +113,7 @@ def _run_startup_diagnostics(logger: logging.Logger) -> list[str]:
     # (説明, 必須かどうか)
     tools = {
         "ffmpeg": ("動画/音声の変換に必要", True),
-        "node": ("高画質ダウンロードに推奨（オプション）", False),
+        "node": ("YouTubeのボット検出を回避する際に必要（cookie使用時のJS解読）", False),
     }
 
     missing_required: list[str] = []

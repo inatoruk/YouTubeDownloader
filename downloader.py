@@ -63,6 +63,8 @@ _PERMANENT_ERROR_PATTERNS = (
     "sign in to confirm your age",
     "is not available in your country",
     "this live event will begin",
+    # ブラウザからcookieを読み取れない（未インストール・プロファイル不在など）
+    "cookies database",
 )
 
 
@@ -72,9 +74,45 @@ def is_permanent_error(message: str) -> bool:
     return any(pattern in low for pattern in _PERMANENT_ERROR_PATTERNS)
 
 
-def describe_error(message: str) -> str:
-    """yt-dlp の生エラーを、次に何をすべきか分かる日本語に変換する。"""
+# YouTube のボット検出（「Sign in to confirm you’re not a bot」）を受けたときに
+# cookie を読み取るブラウザ。ログイン済みの YouTube セッションで検出を回避する。
+COOKIE_BROWSER = "chrome"
+
+
+def is_bot_check_error(message: str) -> bool:
+    """YouTube のボット検出（ログイン要求）によるエラーかどうかを判定する。
+
+    短時間に大量のダウンロードを行うと、回線(IP)単位で全動画が弾かれるようになる。
+    メッセージ中のアポストロフィは ’ (U+2019) になるため、その後ろの語句で判定する。
+    """
+    return "not a bot" in message.lower()
+
+
+def describe_error(message: str, cookies_used: bool = False) -> str:
+    """yt-dlp の生エラーを、次に何をすべきか分かる日本語に変換する。
+
+    Args:
+        cookies_used: 失敗した試行でブラウザの cookie を使っていたか。
+            ボット検出時の案内内容を切り替えるために使う。
+    """
     low = message.lower()
+    if is_bot_check_error(message):
+        if cookies_used:
+            return (
+                "YouTubeにボットと判定されました。Chromeのcookieを使っても解除されませんでした。"
+                " ChromeでYouTubeにログインしているか、キーチェーンの確認で「常に許可」を"
+                "選んだかを確認してください。短時間に大量にダウンロードすると発生するため、"
+                "時間をおいて再試行してください。"
+            )
+        return (
+            "YouTubeにボットと判定されました。短時間に大量にダウンロードすると発生します。"
+            " 時間をおいて再試行してください。"
+        )
+    if "cookies database" in low:
+        return (
+            f"ブラウザ({COOKIE_BROWSER})のcookieを読み取れませんでした。"
+            " ブラウザがインストールされ、YouTubeにログインしているか確認してください。"
+        )
     if "403" in message or "forbidden" in low:
         hint = "YouTubeにアクセスを拒否されました (403)。"
         if is_yt_dlp_stale():
@@ -133,6 +171,11 @@ class Downloader:
 
     _global_update_checked = False
 
+    # ボット検出を一度受けたら、以後このプロセスでは cookie 経路を使う。
+    # 検出された回線で cookie なしのリクエストを重ねても失敗が増えるだけのため。
+    # 全ワーカーで共有するのでクラス属性にしている。
+    _cookies_enabled = False
+
     def __init__(
         self,
         logger: Optional[logging.Logger] = None,
@@ -166,6 +209,57 @@ class Downloader:
             os.environ["PATH"] = os.pathsep.join(new_paths + [current_path])
             self._logger.info("Updated PATH for frozen environment: %s", os.environ["PATH"])
 
+    def _base_options(self) -> dict:
+        """全ての yt-dlp 呼び出しに共通するオプション。"""
+        options: dict = {"quiet": True, "no_warnings": True, "no_color": True}
+        if Downloader._cookies_enabled:
+            options.update(self._cookie_options())
+        return options
+
+    @staticmethod
+    def _cookie_options() -> dict:
+        """ボット検出を回避するためのオプション（ブラウザの cookie ＋ JS チャレンジ解読）。
+
+        cookie を渡すと yt-dlp は cookie 非対応の android 系クライアントを使えなくなり、
+        JS チャレンジの解読が必要な web クライアントに切り替わる。yt-dlp の既定の
+        JS ランタイムは deno のみなので、導入済みの node を明示し、解読スクリプト(ejs)の
+        取得を許可する。cookie だけでは「No video formats found」になることを確認済み。
+        いずれも Python API のパラメータとして有効（yt_dlp/YoutubeDL.py 参照）。
+        """
+        return {
+            "cookiesfrombrowser": (COOKIE_BROWSER, None, None, None),
+            "js_runtimes": {"node": {}},
+            "remote_components": ["ejs:github"],
+        }
+
+    def _enable_cookies(self) -> None:
+        """以後の yt-dlp 呼び出しを cookie 経路に切り替える。"""
+        if not Downloader._cookies_enabled:
+            Downloader._cookies_enabled = True
+            self._logger.warning(
+                "YouTubeのボット検出を受けたため、以後は %s のcookieを使用します",
+                COOKIE_BROWSER,
+            )
+
+    def _extract(self, url: str, extra: dict, handle: Callable[[Optional[dict]], object]):
+        """ダウンロードせずに情報を取得し、handle(info) の結果を返す。
+
+        ボット検出を受けたら cookie 経路で1度だけやり直す。handle は yt-dlp の
+        セッションが開いている間に呼ぶ（従来どおり with ブロック内で処理する）。
+        """
+        for _ in range(2):
+            used_cookies = Downloader._cookies_enabled
+            options = {**self._base_options(), **extra}
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    return handle(ydl.extract_info(url, download=False))
+            except Exception as exc:
+                if is_bot_check_error(str(exc)) and not used_cookies:
+                    self._enable_cookies()
+                    continue
+                raise
+        return None
+
     def download(
         self,
         request: DownloadRequest,
@@ -189,19 +283,24 @@ class Downloader:
         output_dir = Path(request.output_path)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        ydl_opts = self._build_options(request, progress_hooks)
-
         def cancelled() -> bool:
             return is_cancelled is not None and is_cancelled()
 
         last_error: Optional[Exception] = None
-        for attempt in range(1, self._max_retries + 1):
+        last_used_cookies = False
+        attempt = 0
+        while attempt < self._max_retries:
+            attempt += 1
             # リトライ前に毎回チェックし、キャンセル後の再ダウンロードを防ぐ
             if cancelled():
                 raise DownloadCancelled("キャンセルされました")
+            # cookie 経路への切り替えを反映するため、オプションは試行ごとに組み立てる
+            used_cookies = Downloader._cookies_enabled
+            ydl_opts = self._build_options(request, progress_hooks)
             try:
                 self._logger.info(
-                    "Start download (attempt %s/%s): url=%s", attempt, self._max_retries, request.url
+                    "Start download (attempt %s/%s, cookies=%s): url=%s",
+                    attempt, self._max_retries, used_cookies, request.url,
                 )
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(request.url, download=True)
@@ -226,7 +325,18 @@ class Downloader:
                     self._logger.info("Download cancelled: %s", request.url)
                     raise DownloadCancelled("キャンセルされました") from exc
                 last_error = exc
+                last_used_cookies = used_cookies
                 self._logger.warning("Download failed (attempt %s): %s", attempt, exc)
+                if is_bot_check_error(str(exc)):
+                    if not used_cookies:
+                        # cookie 経路に切り替えて即座にやり直す。切り替えは試行回数に
+                        # 数えない（次の試行は必ず cookie を使うため無限ループしない）。
+                        self._enable_cookies()
+                        attempt -= 1
+                        continue
+                    # cookie を使っても検出される場合、すぐ再試行しても結果は変わらない
+                    self._logger.info("Bot check persists even with cookies, giving up")
+                    break
                 # 403やdeleted等、再試行しても結果が変わらない失敗は即座に諦める。
                 # （以前はここで無駄に3回リトライしていた）
                 if is_permanent_error(str(exc)):
@@ -239,7 +349,9 @@ class Downloader:
                     self._logger.info("Retrying in %s seconds", sleep_seconds)
                     time.sleep(sleep_seconds)
 
-        raise DownloadError(describe_error(str(last_error))) from last_error
+        raise DownloadError(
+            describe_error(str(last_error), cookies_used=last_used_cookies)
+        ) from last_error
 
     def fetch_info(self, url: str) -> Optional[dict]:
         """動画の情報をダウンロードせずに取得する。
@@ -248,25 +360,20 @@ class Downloader:
             動画情報の辞書（title, duration, thumbnail等）。
             取得に失敗した場合は None。
         """
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "no_color": True,
-            "noplaylist": True,
-            "skip_download": True,
-        }
+        def summarize(info: Optional[dict]) -> Optional[dict]:
+            if not info:
+                return None
+            return {
+                "title": info.get("title", ""),
+                "duration": info.get("duration"),
+                "thumbnail": info.get("thumbnail", ""),
+                "uploader": info.get("uploader", ""),
+                "view_count": info.get("view_count"),
+                "filesize": self._format_filesize(info.get("filesize") or info.get("filesize_approx")),
+            }
+
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if info:
-                    return {
-                        "title": info.get("title", ""),
-                        "duration": info.get("duration"),
-                        "thumbnail": info.get("thumbnail", ""),
-                        "uploader": info.get("uploader", ""),
-                        "view_count": info.get("view_count"),
-                        "filesize": self._format_filesize(info.get("filesize") or info.get("filesize_approx")),
-                    }
+            return self._extract(url, {"noplaylist": True, "skip_download": True}, summarize)
         except Exception as exc:
             self._logger.warning("Info fetch failed for %s: %s", url, exc)
         return None
@@ -289,39 +396,34 @@ class Downloader:
         Returns:
             動画URLのリスト。
         """
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "no_color": True,
-            "extract_flat": "in_playlist",
-            "noplaylist": False,
-        }
         urls: list[str] = []
+
+        def collect(info: Optional[dict]) -> None:
+            if info and "entries" in info:
+                for entry in info["entries"]:
+                    if entry is None:
+                        continue
+                    # ネストされたプレイリスト（チャンネルの「動画」タブなど）を再帰的に展開
+                    if "entries" in entry:
+                        for sub_entry in entry["entries"]:
+                            if sub_entry and sub_entry.get("url"):
+                                video_url = sub_entry["url"]
+                                if not video_url.startswith("http"):
+                                    video_url = f"https://www.youtube.com/watch?v={video_url}"
+                                urls.append(video_url)
+                    elif entry.get("url"):
+                        video_url = entry["url"]
+                        if not video_url.startswith("http"):
+                            video_url = f"https://www.youtube.com/watch?v={video_url}"
+                        urls.append(video_url)
+                self._logger.info(
+                    "Extracted %d URLs from channel: %s", len(urls), channel_url
+                )
+            elif info and info.get("webpage_url"):
+                urls.append(info["webpage_url"])
+
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(channel_url, download=False)
-                if info and "entries" in info:
-                    for entry in info["entries"]:
-                        if entry is None:
-                            continue
-                        # ネストされたプレイリスト（チャンネルの「動画」タブなど）を再帰的に展開
-                        if "entries" in entry:
-                            for sub_entry in entry["entries"]:
-                                if sub_entry and sub_entry.get("url"):
-                                    video_url = sub_entry["url"]
-                                    if not video_url.startswith("http"):
-                                        video_url = f"https://www.youtube.com/watch?v={video_url}"
-                                    urls.append(video_url)
-                        elif entry.get("url"):
-                            video_url = entry["url"]
-                            if not video_url.startswith("http"):
-                                video_url = f"https://www.youtube.com/watch?v={video_url}"
-                            urls.append(video_url)
-                    self._logger.info(
-                        "Extracted %d URLs from channel: %s", len(urls), channel_url
-                    )
-                elif info and info.get("webpage_url"):
-                    urls.append(info["webpage_url"])
+            self._extract(channel_url, {"extract_flat": "in_playlist", "noplaylist": False}, collect)
         except Exception as exc:
             self._logger.error("Channel extraction failed: %s", exc)
             raise DownloadError(f"チャンネルの展開に失敗しました: {channel_url}") from exc
@@ -333,31 +435,26 @@ class Downloader:
         Returns:
             動画URLのリスト。
         """
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "no_color": True,
-            "extract_flat": "in_playlist",
-            "noplaylist": False,
-        }
         urls: list[str] = []
+
+        def collect(info: Optional[dict]) -> None:
+            if info and "entries" in info:
+                for entry in info["entries"]:
+                    if entry and entry.get("url"):
+                        video_url = entry["url"]
+                        # フルURLに変換
+                        if not video_url.startswith("http"):
+                            video_url = f"https://www.youtube.com/watch?v={video_url}"
+                        urls.append(video_url)
+                self._logger.info(
+                    "Extracted %d URLs from playlist: %s", len(urls), playlist_url
+                )
+            elif info and info.get("webpage_url"):
+                # プレイリストではなく単一動画だった場合
+                urls.append(info["webpage_url"])
+
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(playlist_url, download=False)
-                if info and "entries" in info:
-                    for entry in info["entries"]:
-                        if entry and entry.get("url"):
-                            video_url = entry["url"]
-                            # フルURLに変換
-                            if not video_url.startswith("http"):
-                                video_url = f"https://www.youtube.com/watch?v={video_url}"
-                            urls.append(video_url)
-                    self._logger.info(
-                        "Extracted %d URLs from playlist: %s", len(urls), playlist_url
-                    )
-                elif info and info.get("webpage_url"):
-                    # プレイリストではなく単一動画だった場合
-                    urls.append(info["webpage_url"])
+            self._extract(playlist_url, {"extract_flat": "in_playlist", "noplaylist": False}, collect)
         except Exception as exc:
             self._logger.error("Playlist extraction failed: %s", exc)
             raise DownloadError(f"プレイリストの展開に失敗しました: {playlist_url}") from exc
@@ -421,12 +518,10 @@ class Downloader:
         output_dir = Path(request.output_path)
         
         options: dict = {
+            **self._base_options(),
             "outtmpl": str(output_dir / "%(title)s.%(ext)s"),
             "noplaylist": True,
             "ignoreerrors": False,
-            "quiet": True,
-            "no_warnings": True,
-            "no_color": True,
             "progress_hooks": list(progress_hooks or []),
             "overwrites": True,
             "prefer_ffmpeg": True,
@@ -449,9 +544,9 @@ class Downloader:
             options["format"] = format_selector
             options["merge_output_format"] = "mp4"
 
-        # 注意: js_runtimesやremote_componentsはCLI専用オプションであり、
-        # Python APIでは互換性がないため使用しない。
-        # 高解像度フォーマットの取得はyt-dlpのデフォルト動作に依存する。
+        # js_runtimes / remote_components は Python API でも有効なパラメータ。
+        # 通常は cookie なしの既定クライアントで十分なため指定せず、
+        # ボット検出時のみ _cookie_options() で有効にする。
 
         return options
 
