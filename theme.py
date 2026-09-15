@@ -1,216 +1,101 @@
-"""アプリケーション共通テーマ定義。
-
-全ウィジェットが参照するカラーパレットとグローバルスタイルシートを提供する。
-"""
-
+"""Air × Native palette. Gradients are reserved for background surfaces."""
 from queue_manager import ItemStatus
 
 
 class Theme:
-    """ダークテーマのカラー定数。"""
+    @classmethod
+    def configure(cls, dark=False):
+        cls.dark = dark
+        colors = {
+            'BG_DARK': ('#F8FBFF', '#1F2B39'),
+            'BG_CARD': ('#FFFFFF', '#263547'),
+            'TEXT_PRIMARY': ('#263449', '#E5EDF9'),
+            'TEXT_SECONDARY': ('#61758D', '#B2C1D5'),
+            'TEXT_TERTIARY': ('#6C8098', '#A0B2CA'),
+            'ACCENT': ('#3378E6', '#94BAFF'),
+            'ACCENT_HOVER': ('#2565C9', '#AFCCFF'),
+            'ON_ACCENT': ('#FFFFFF', '#182F52'),
+            'INPUT_BG': ('#FFFFFF', '#263547'),
+            'INPUT_BORDER': ('#D6E2F0', '#43566D'),
+            'CARD_BORDER': ('#DFE8F3', '#3E5067'),
+            'SIDEBAR_TOP': ('#C8DFFF', '#264C78'),
+            'SIDEBAR_BOTTOM': ('#EDF7FF', '#243947'),
+            'BG_BOTTOM': ('#FFFFFF', '#233847'),
+            'TRACK': ('#DCE6F2', '#3A4D62'),
+            'SUCCESS': ('#24724F', '#77D6AA'),
+            'ERROR': ('#BF3838', '#FF9696'),
+            'WARNING': ('#98601C', '#EDBD75'),
+        }
+        for name, pair in colors.items():
+            setattr(cls, name, pair[bool(dark)])
+        cls.ACCENT_LIGHT = cls.ACCENT
+        cls.INPUT_BORDER_FOCUS = cls.ACCENT
+        cls.ACCENT_GLOW = cls.TRACK
 
-    # 背景色
-    BG_DARK = "#0A0A0A"
-    BG_CARD = "#161616"
 
-    # テキスト
-    TEXT_PRIMARY = "#FFFFFF"
-    TEXT_SECONDARY = "#8E8E93"
-    TEXT_TERTIARY = "#636366"
-
-    # アクセント（青のグラデーション用）
-    ACCENT = "#0A84FF"
-    ACCENT_LIGHT = "#5AC8FA"
-    ACCENT_HOVER = "#0070E0"
-    ACCENT_GLOW = "rgba(10, 132, 255, 0.3)"
-
-    # 入力欄
-    INPUT_BG = "#1C1C1E"
-    INPUT_BORDER = "#38383A"
-    INPUT_BORDER_FOCUS = "#0A84FF"
-
-    # カード
-    CARD_BORDER = "#2C2C2E"
-
-    # 状態色
-    SUCCESS = "#30D158"
-    ERROR = "#FF453A"
-    WARNING = "#FF9F0A"
-
-
-# --- ステータスアイコン（モノクロ記号、UI色に染まる） ---
+Theme.configure()
 STATUS_ICONS = {
-    ItemStatus.PENDING: "⋯",
-    ItemStatus.RESOLVING: "↻",
-    ItemStatus.DOWNLOADING: "↓",
-    ItemStatus.COMPLETED: "✓",
-    ItemStatus.FAILED: "✕",
-    ItemStatus.CANCELLED: "⊘",
+    ItemStatus.PENDING: '待機', ItemStatus.RESOLVING: '取得中',
+    ItemStatus.DOWNLOADING: '保存中', ItemStatus.COMPLETED: '✓ 完了',
+    ItemStatus.FAILED: '失敗', ItemStatus.CANCELLED: '停止',
 }
 
 
-def build_global_stylesheet() -> str:
-    """MainWindow に適用するグローバルスタイルシートを返す。"""
-    return f"""
-        QMainWindow {{
-            background-color: {Theme.BG_DARK};
-        }}
-        QScrollArea {{
-            border: none;
-            background-color: transparent;
-        }}
-        QWidget {{
-            background-color: transparent;
-            color: {Theme.TEXT_PRIMARY};
-            font-family: "SF Pro Display", "Helvetica Neue", "Segoe UI", sans-serif;
-            font-size: 13px;
-        }}
-
-        /* 入力欄 */
-        QLineEdit {{
-            background-color: {Theme.INPUT_BG};
-            border: 1px solid {Theme.INPUT_BORDER};
-            border-radius: 10px;
-            padding: 14px 16px;
-            color: {Theme.TEXT_PRIMARY};
-            font-size: 14px;
-            selection-background-color: {Theme.ACCENT};
-        }}
-        QLineEdit:focus {{
-            border: 2px solid {Theme.ACCENT};
-            padding: 13px 15px;
-        }}
-        QLineEdit:hover {{
-            border: 1px solid {Theme.TEXT_TERTIARY};
-        }}
-
-        /* メインボタン */
-        QPushButton {{
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                stop:0 {Theme.ACCENT}, stop:1 {Theme.ACCENT_LIGHT});
-            color: white;
-            border: none;
-            border-radius: 12px;
-            padding: 12px 24px;
-            font-size: 14px;
-            font-weight: 600;
-        }}
-        QPushButton:hover {{
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                stop:0 {Theme.ACCENT_HOVER}, stop:1 {Theme.ACCENT});
-        }}
-        QPushButton:pressed {{
-            background: {Theme.ACCENT_HOVER};
-        }}
-        QPushButton:disabled {{
-            background: {Theme.INPUT_BORDER};
-            color: {Theme.TEXT_TERTIARY};
-        }}
-
-        /* セカンダリボタン */
-        QPushButton#secondary {{
-            background-color: {Theme.INPUT_BG};
-            border: 1px solid {Theme.INPUT_BORDER};
-            color: {Theme.TEXT_PRIMARY};
-        }}
-        QPushButton#secondary:hover {{
-            background-color: {Theme.CARD_BORDER};
-            border: 1px solid {Theme.TEXT_TERTIARY};
-        }}
-
-        /* プログレスバー */
-        QProgressBar {{
-            background-color: {Theme.INPUT_BG};
-            border: none;
-            border-radius: 6px;
-            text-align: center;
-        }}
-        QProgressBar::chunk {{
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                stop:0 {Theme.ACCENT}, stop:1 {Theme.ACCENT_LIGHT});
-            border-radius: 6px;
-        }}
-
-        /* カード */
-        QFrame#Card {{
-            background-color: {Theme.BG_CARD};
-            border: 1px solid {Theme.CARD_BORDER};
-            border-radius: 16px;
-        }}
-
-        /* カードタイトル */
-        QLabel#Title {{
-            font-size: 13px;
-            font-weight: 600;
-            color: {Theme.TEXT_SECONDARY};
-            letter-spacing: 0.5px;
-        }}
-
-        /* コンボボックス */
-        QComboBox {{
-            background-color: {Theme.INPUT_BG};
-            border: 1px solid {Theme.INPUT_BORDER};
-            border-radius: 8px;
-            padding: 8px 12px;
-            color: {Theme.TEXT_PRIMARY};
-            font-size: 13px;
-        }}
-        QComboBox:hover {{
-            border: 1px solid {Theme.TEXT_TERTIARY};
-        }}
-        QComboBox::drop-down {{
-            border: none;
-            width: 24px;
-        }}
-        QComboBox::down-arrow {{
-            image: none;
-        }}
-        QComboBox QAbstractItemView {{
-            background-color: {Theme.BG_CARD};
-            border: 1px solid {Theme.CARD_BORDER};
-            border-radius: 8px;
-            selection-background-color: {Theme.ACCENT};
-            color: {Theme.TEXT_PRIMARY};
-            outline: none;
-        }}
-        QComboBox QAbstractItemView::item {{
-            padding: 8px 10px;
-            min-height: 28px;
-            border-radius: 4px;
-            margin: 2px;
-        }}
-        QComboBox QAbstractItemView::item:hover {{
-            background-color: {Theme.INPUT_BG};
-        }}
-
-        /* ラジオボタン */
-        QRadioButton {{
-            spacing: 10px;
-            font-size: 14px;
-        }}
-        QRadioButton::indicator {{
-            width: 20px;
-            height: 20px;
-            border-radius: 10px;
-            border: 2px solid {Theme.INPUT_BORDER};
-            background: transparent;
-        }}
-        QRadioButton::indicator:hover {{
-            border: 2px solid {Theme.TEXT_TERTIARY};
-        }}
-        QRadioButton::indicator:checked {{
-            border: 2px solid {Theme.ACCENT};
-            background: qradialgradient(cx:0.5, cy:0.5, radius:0.4,
-                fx:0.5, fy:0.5, stop:0 {Theme.ACCENT}, stop:1 {Theme.ACCENT});
-        }}
-
-        /* メッセージボックス */
-        QMessageBox {{
-            background-color: {Theme.BG_CARD};
-        }}
-        QMessageBox QLabel {{
-            color: {Theme.TEXT_PRIMARY};
-            font-size: 13px;
-            min-width: 400px;
-        }}
-    """
+def build_global_stylesheet():
+    return f'''
+    QWidget {{ color: {Theme.TEXT_PRIMARY};
+        font-size: 16px; background: transparent; }}
+    QMainWindow, QDialog, QMessageBox {{ background: {Theme.BG_DARK}; }}
+    QWidget#Workspace {{ background: {Theme.BG_DARK}; }}
+    QFrame#Sidebar {{ background: transparent; }}
+    QFrame#InputGroup {{ background: {Theme.INPUT_BG}; border: 1px solid {Theme.INPUT_BORDER}; border-radius: 12px; }}
+    QLineEdit#UrlInput {{ background: transparent; border: none; padding: 14px 20px; font-size: 16px; }}
+    QLabel#MediaTitle {{ font-size: 16px; font-weight: 500; }}
+    QPushButton::menu-indicator {{ image: none; width: 0; height: 0; }}
+    QComboBox::down-arrow {{ image: none; }}
+    QPushButton#segmentOption {{ background: transparent; color: {Theme.TEXT_SECONDARY}; border: 1px solid transparent; border-radius: 6px; padding: 6px 10px; }}
+    QPushButton#segmentOption:checked {{ background: transparent; color: {Theme.TEXT_PRIMARY}; }}
+    QFrame#Card {{ border: none; background: transparent; }}
+    QFrame#OutputGroup {{ border: none; border-top: 1px solid {Theme.CARD_BORDER}; }}
+    QFrame#Footer {{ border-top: 1px solid {Theme.CARD_BORDER}; }}
+    QFrame#QueueItem {{ border: none; border-bottom: 1px solid {Theme.CARD_BORDER}; }}
+    QLabel#Title {{ font-size: 15px; font-weight: 600; color: {Theme.TEXT_SECONDARY}; }}
+    QLabel#Secondary {{ color: {Theme.TEXT_SECONDARY}; font-size: 14px; }}
+    QLabel#Error {{ color: {Theme.ERROR}; font-size: 14px; }}
+    QLabel#Thumbnail {{ background: {Theme.TRACK}; border-radius: 7px; color: {Theme.TEXT_TERTIARY}; }}
+    QLabel#Duration {{ background: #263B50; color: white; border-radius: 3px; font-size: 12px; padding: 1px 3px; }}
+    QLineEdit, QTextEdit {{ background: {Theme.INPUT_BG}; border: 1px solid {Theme.INPUT_BORDER};
+        border-radius: 10px; padding: 14px 18px; color: {Theme.TEXT_PRIMARY};
+        selection-background-color: {Theme.ACCENT}; selection-color: {Theme.ON_ACCENT}; }}
+    QPushButton {{ background: {Theme.ACCENT}; color: {Theme.ON_ACCENT}; border: 1px solid transparent;
+        border-radius: 10px; padding: 14px 22px; font-size: 15px; font-weight: 500; }}
+    QPushButton:hover {{ background: {Theme.ACCENT_HOVER}; }}
+    QPushButton:disabled {{ background: {Theme.TRACK}; color: {Theme.TEXT_TERTIARY}; }}
+    QPushButton#secondary {{ background: {Theme.INPUT_BG}; color: {Theme.TEXT_PRIMARY}; border: 1px solid {Theme.INPUT_BORDER}; }}
+    QPushButton#secondary:hover {{ background: {Theme.TRACK}; }}
+    QPushButton#link {{ background: transparent; color: {Theme.ACCENT}; padding: 4px 0; border: none; }}
+    QPushButton#icon {{ background: transparent; color: {Theme.TEXT_SECONDARY}; padding: 0; border: none; font-size: 16px; }}
+    QPushButton#icon:hover {{ background: {Theme.TRACK}; }}
+    QFrame#Segment {{ background: transparent; border-radius: 9px; }}
+    QRadioButton {{ padding: 7px; border-radius: 6px; color: {Theme.TEXT_SECONDARY}; }}
+    QRadioButton::indicator {{ width: 0; height: 0; }}
+    QRadioButton:checked {{ background: {Theme.BG_CARD}; color: {Theme.TEXT_PRIMARY}; }}
+    QComboBox {{ background: {Theme.INPUT_BG}; border: 1px solid {Theme.INPUT_BORDER};
+        border-radius: 9px; padding: 13px 16px; font-size: 15px; }}
+    QComboBox::drop-down {{ border: none; width: 20px; }}
+    QComboBox QAbstractItemView {{ background: {Theme.BG_CARD}; color: {Theme.TEXT_PRIMARY};
+        border: 1px solid {Theme.INPUT_BORDER}; selection-background-color: {Theme.ACCENT};
+        selection-color: {Theme.ON_ACCENT}; font-size: 17px; padding: 4px; }}
+    QMenu {{ background: {Theme.BG_CARD}; color: {Theme.TEXT_PRIMARY};
+        border: 1px solid {Theme.INPUT_BORDER}; selection-background-color: {Theme.ACCENT};
+        selection-color: {Theme.ON_ACCENT}; }}
+    QMenu::item {{ padding: 7px 18px; }}
+    QMenu::item:selected {{ background: {Theme.ACCENT}; color: {Theme.ON_ACCENT}; }}
+    QMenu::item:disabled {{ color: {Theme.TEXT_TERTIARY}; }}
+    QScrollArea {{ border: none; background: transparent; }}
+    QScrollBar:vertical {{ width: 8px; background: transparent; margin: 0; }}
+    QScrollBar::handle:vertical {{ background: {Theme.INPUT_BORDER}; min-height: 24px; border-radius: 4px; }}
+    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+    QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+    QToolTip {{ background: {Theme.BG_CARD}; color: {Theme.TEXT_PRIMARY}; border: 1px solid {Theme.INPUT_BORDER}; }}
+    '''

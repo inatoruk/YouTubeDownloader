@@ -10,6 +10,7 @@ URLリストからダウンロードキューを構築し、最大N本の並列�
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -18,8 +19,20 @@ from typing import Optional, Sequence
 from PySide6.QtCore import QObject, Signal, Slot, QThread
 
 from downloader import DownloadCancelled, DownloadRequest, Downloader
+from utils.worker import CancellableWorker
+from utils.urls import classify_url
 
 logger = logging.getLogger(__name__)
+
+
+def format_bytes(value):
+    if value is None:
+        return "—"
+    number = max(0, value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if number < 1024 or unit == "TB":
+            return f"{number:.0f} B" if unit == "B" else f"{number:.1f} {unit}"
+        number /= 1024
 
 
 class ItemStatus(Enum):
@@ -48,32 +61,81 @@ class DownloadItem:
     duration: Optional[str] = None  # 動画の長さ（表示用）
     filesize: Optional[str] = None  # ファイルサイズ（表示用）
 
+    uploader: str = ""
+    thumbnail_url: str = ""
+    filesize_bytes: Optional[int] = None
+    stream_bytes: dict[str, int] = field(default_factory=dict)
+    stream_totals: dict[str, Optional[int]] = field(default_factory=dict)
+    expected_streams: set[str] = field(default_factory=set)
+    phase: str = ""
+
+    @property
+    def downloaded_bytes(self):
+        return sum(self.stream_bytes.values())
+
+    @property
+    def transfer_total_bytes(self):
+        if not self.stream_totals:
+            return self.filesize_bytes
+        if self.expected_streams and not self.expected_streams.issubset(self.stream_totals):
+            return None
+        values = list(self.stream_totals.values())
+        return sum(values) if all(value is not None for value in values) else None
+
+    def record_transfer(self, data):
+        info = data.get('info_dict') or {}
+        formats = info.get('requested_downloads') or info.get('requested_formats') or []
+        for fmt in formats:
+            if fmt.get('format_id') is not None:
+                key = str(fmt['format_id'])
+                self.expected_streams.add(key)
+                total = fmt.get('filesize') or fmt.get('filesize_approx')
+                if isinstance(total, (int, float)) and total >= 0:
+                    self.stream_totals.setdefault(key, int(total))
+        key = str(info.get('format_id') or data.get('filename') or 'media')
+        received = data.get('downloaded_bytes')
+        total = data.get('total_bytes') or data.get('total_bytes_estimate')
+        if isinstance(received, (int, float)) and received >= 0:
+            self.stream_bytes[key] = max(self.stream_bytes.get(key, 0), int(received))
+        if data.get('status') == 'finished' and isinstance(received, (int, float)):
+            total = received
+        if isinstance(total, (int, float)) and total >= 0:
+            self.stream_totals[key] = max(int(total), self.stream_bytes.get(key, 0))
+        else:
+            self.stream_totals.setdefault(key, None)
+        self.phase = '変換・結合中' if data.get('status') == 'finished' else '保存中'
+
     # 複数ファイル（映像＋音声など）のダウンロード時に進捗が逆行するのを防ぎ、表示進捗を合成する
     _max_raw_progress: float = 0.0
     _current_pass: int = 0
 
+    _display_progress: float = 0.0
+
     @property
     def display_progress(self) -> float:
-        """UI表示用に逆行を防ぎ、映像80% + 音声20%等として合成した仮想進捗 (0.0〜100.0) を返す"""
-        if self.status == ItemStatus.COMPLETED:
-            return 100.0
-            
-        # 値が10%以上下がったら、次のファイル（音声等）のダウンロードが始まったと判定してパスを切り替え
+        return 100.0 if self.status == ItemStatus.COMPLETED else self._display_progress
+
+    def update_progress(self, value: float):
+        self.progress = max(0.0, min(100.0, value))
         if self.progress < self._max_raw_progress - 10.0:
             self._current_pass = 1
-            self._max_raw_progress = self.progress
-            
+            self._max_raw_progress = 0.0
         self._max_raw_progress = max(self._max_raw_progress, self.progress)
-        
-        if self._current_pass == 0:
-            # 1つめのファイル（映像は非常に重いので90%のウェイト）
-            return self.progress * 0.9
-        else:
-            # 2つめのファイル（音声は残り10%のウェイト）
-            return 90.0 + (self.progress * 0.1)
+        value = self.progress * 0.9 if self._current_pass == 0 else 90.0 + self.progress * 0.1
+        self._display_progress = min(99.0, max(self._display_progress, value))
+
+    def reset_for_retry(self):
+        self.status = ItemStatus.PENDING
+        self.progress = self._max_raw_progress = self._display_progress = 0.0
+        self._current_pass = 0
+        self.error = self.filepath = None
+        self.stream_bytes.clear()
+        self.stream_totals.clear()
+        self.expected_streams.clear()
+        self.phase = ""
 
 
-class _SingleWorker(QThread):
+class _SingleWorker(CancellableWorker):
     """1本分のダウンロードを実行するワーカースレッド。"""
     # シグナルのキーはインデックスではなく item_id（str）
     progress = Signal(str, dict)          # (item_id, progress_data)
@@ -85,14 +147,9 @@ class _SingleWorker(QThread):
         self.item_id = item_id
         self.request = request
         self._downloader = Downloader(auto_update=False)
-        self._cancelled = False
-
-    def cancel(self):
-        """キャンセルフラグを立てる。"""
-        self._cancelled = True
 
     def run(self):
-        if self._cancelled:
+        if self.is_cancelled():
             self.finished_item.emit(self.item_id, False, "キャンセルされました")
             return
 
@@ -100,7 +157,7 @@ class _SingleWorker(QThread):
             self.status_changed.emit(self.item_id, ItemStatus.DOWNLOADING.value)
 
             def progress_hook(d):
-                if self._cancelled:
+                if self.is_cancelled():
                     # 専用例外にすることでリトライループに飲まれない
                     raise DownloadCancelled("キャンセルされました")
                 self.progress.emit(self.item_id, d)
@@ -108,23 +165,23 @@ class _SingleWorker(QThread):
             filepath = self._downloader.download(
                 request=self.request,
                 progress_hooks=[progress_hook],
-                is_cancelled=lambda: self._cancelled,
+                is_cancelled=self.is_cancelled,
             )
-            if self._cancelled:
+            if self.is_cancelled():
                 self.finished_item.emit(self.item_id, False, "キャンセルされました")
             else:
                 self.finished_item.emit(self.item_id, True, filepath or "ダウンロード完了")
         except DownloadCancelled:
             self.finished_item.emit(self.item_id, False, "キャンセルされました")
         except Exception as e:
-            if self._cancelled:
+            if self.is_cancelled():
                 self.finished_item.emit(self.item_id, False, "キャンセルされました")
             else:
                 logger.error("Download error for item %s: %s", self.item_id, e)
                 self.finished_item.emit(self.item_id, False, str(e))
 
 
-class _InfoWorker(QThread):
+class _InfoWorker(CancellableWorker):
     """動画情報をプリフェッチするワーカースレッド。"""
     info_fetched = Signal(str, dict)    # (item_id, info_dict)
     info_failed = Signal(str, str)      # (item_id, error_message)
@@ -137,7 +194,7 @@ class _InfoWorker(QThread):
 
     def run(self):
         try:
-            info = self._downloader.fetch_info(self.url)
+            info = self._downloader.fetch_info(self.url, self.is_cancelled)
             if info:
                 self.info_fetched.emit(self.item_id, info)
             else:
@@ -161,11 +218,13 @@ class BatchDownloadManager(QObject):
 
     # --- シグナル（item_id は str） ---
     item_added = Signal(str, object)           # (item_id, DownloadItem)
+    item_metadata_changed = Signal(str)
     item_progress = Signal(str, float)         # (item_id, percent)
     item_status_changed = Signal(str, str)     # (item_id, status_value)
     item_title_resolved = Signal(str, str)     # (item_id, title)
     item_finished = Signal(str, bool, str)     # (item_id, success, message)
     all_finished = Signal(int, int)            # (success_count, fail_count)
+    expansion_result = Signal(str, str, str, str)  # id, URL, outcome, message
     queue_changed = Signal()                   # キュー内容が変化した
 
     # タイトル取得の同時実行数。チャンネル展開で数百件が一度に入っても
@@ -183,6 +242,9 @@ class BatchDownloadManager(QObject):
         # 複数プレイリストの同時展開に対応するためリストで管理（#3修正）
         self._playlist_workers: list[_PlaylistExpandWorker] = []
         self._is_running = False
+        self._closing = False
+        self._generation = 0
+        self._expansion_errors: dict[str, str] = {}
         self._base_request: Optional[DownloadRequest] = None
 
     # --- プロパティ ---
@@ -235,13 +297,15 @@ class BatchDownloadManager(QObject):
 
     def add_urls(self, urls: Sequence[str]) -> list[str]:
         """URLリストをキューに追加する。追加された item_id リストを返す。"""
+        if self._closing:
+            return []
         added_ids: list[str] = []
         existing_urls = {item.url for item in self._items}
 
         for raw_url in urls:
-            url = raw_url.strip()
-            if not url:
-                continue
+            url, kind = classify_url(raw_url)
+            if kind != "video":
+                raise ValueError("動画URLを入力してください")
             if url in existing_urls:
                 logger.info("Duplicate URL skipped: %s", url)
                 continue
@@ -259,27 +323,61 @@ class BatchDownloadManager(QObject):
             self.queue_changed.emit()
         return added_ids
 
-    def add_playlist_items(self, playlist_url: str) -> None:
-        """プレイリストURLを展開してキューに追加する。
+    @property
+    def expanding_count(self):
+        return sum(w.generation == self._generation for w in self._playlist_workers)
 
-        展開処理はバックグラウンドスレッドで行われ、個別の動画URLがキューに追加される。
-        複数プレイリストの同時展開に対応するためリストで管理する（#3修正）。
-        """
+    @property
+    def busy(self):
+        return bool(self._active_workers or self._info_workers or self._playlist_workers)
+
+    @property
+    def active_download_count(self):
+        return len(self._active_workers)
+
+    @property
+    def expansion_errors(self):
+        return dict(self._expansion_errors)
+
+    @property
+    def output_path(self):
+        return self._base_request.output_path if self._base_request else ""
+
+    def shutdown(self):
+        self._closing = True
+        self.stop_all()
+        self._generation += 1
+        self._expansion_errors.clear()
+        for worker in [*self._info_workers.values(), *self._playlist_workers]:
+            worker.cancel()
+        self._info_queue.clear()
+
+    def add_playlist_items(self, playlist_url: str) -> None:
+        if self._closing:
+            return
+        playlist_url, kind = classify_url(playlist_url)
+        if kind != 'playlist':
+            raise ValueError('プレイリストURLを入力してください')
+        self._expansion_errors.pop(playlist_url, None)
         worker = _PlaylistExpandWorker(playlist_url, self)
+        worker.generation = self._generation
+        worker.operation_id = str(uuid.uuid4())
         worker.urls_extracted.connect(self._on_playlist_expanded)
         worker.expand_failed.connect(self._on_playlist_expand_failed)
-        # 完了後にリストから除去してメモリを解放
-        worker.finished.connect(lambda: self._cleanup_playlist_worker(worker))
+        worker.finished.connect(self._cleanup_playlist_worker)
         self._playlist_workers.append(worker)
+        self.expansion_result.emit(worker.operation_id, playlist_url, 'started', 'プレイリストを展開中...')
         worker.start()
+        self.queue_changed.emit()
 
-    def _cleanup_playlist_worker(self, worker: _PlaylistExpandWorker) -> None:
-        """プレイリスト展開ワーカーをリストから除去してクリーンアップする。"""
-        try:
+    @Slot()
+    def _cleanup_playlist_worker(self):
+        worker = self.sender()
+        if worker in self._playlist_workers:
             self._playlist_workers.remove(worker)
-        except ValueError:
-            pass
-        worker.deleteLater()
+            worker.deleteLater()
+        self._dispatch_next()
+        self.queue_changed.emit()
 
     def remove_item(self, item_id: str) -> None:
         """キューからアイテムを削除する。ダウンロード中のものはキャンセルする。"""
@@ -310,6 +408,10 @@ class BatchDownloadManager(QObject):
     def clear_all(self) -> None:
         """全てのアイテムをキューから除去する。ダウンロード中のものがあれば停止する。"""
         self.stop_all()
+        self._generation += 1
+        self._expansion_errors.clear()
+        for worker in [*self._info_workers.values(), *self._playlist_workers]:
+            worker.cancel()
         self._info_queue.clear()
         self._items.clear()
         self.queue_changed.emit()
@@ -318,6 +420,8 @@ class BatchDownloadManager(QObject):
 
     def start_all(self, base_request: DownloadRequest) -> None:
         """全ての待機中アイテムのダウンロードを開始する。"""
+        if self._closing:
+            return
         self._base_request = base_request
         self._is_running = True
         self._dispatch_next()
@@ -328,31 +432,16 @@ class BatchDownloadManager(QObject):
         for item_id in list(self._active_workers.keys()):
             self._cancel_worker(item_id)
 
-    def wait_all_workers(self, timeout_ms: int = 5000) -> None:
-        """全てのアクティブワーカーの終了を待機する（アプリ終了時に使用）。
-
-        アクティブな _SingleWorker スレッドが Qt オブジェクト破棄後も
-        走り続けることによる segfault を防ぐ（#9修正）。
-
-        Args:
-            timeout_ms: 各ワーカーへの最大待機時間（ms）。超過した場合は強制終了。
-        """
-        for worker in list(self._active_workers.values()):
-            if worker.isRunning():
-                if not worker.wait(timeout_ms):
-                    logger.warning(
-                        "Worker %s がタイムアウトしました、強制終了します", worker.item_id
-                    )
-                    worker.terminate()
-                    worker.wait(1000)
+    def wait_all_workers(self, timeout_ms: int = 5000) -> bool:
+        """Bounded wait for callers outside the GUI; never terminate threads."""
+        workers = [*self._active_workers.values(), *self._info_workers.values(), *self._playlist_workers]
+        return all([worker.wait(timeout_ms) for worker in workers])
 
     def retry_item(self, item_id: str) -> None:
         """失敗したアイテムをリトライする。"""
         item = self.find_item_by_id(item_id)
         if item and item.status in (ItemStatus.FAILED, ItemStatus.CANCELLED):
-            item.status = ItemStatus.PENDING
-            item.progress = 0.0
-            item.error = None
+            item.reset_for_retry()
             self.item_status_changed.emit(item_id, ItemStatus.PENDING.value)
             self.item_progress.emit(item_id, 0.0)
             if self._is_running:
@@ -362,9 +451,8 @@ class BatchDownloadManager(QObject):
         """全ての失敗アイテムをリトライする。"""
         for item in self._items:
             if item.status == ItemStatus.FAILED:
-                item.status = ItemStatus.PENDING
-                item.progress = 0.0
-                item.error = None
+                item.reset_for_retry()
+                self.item_progress.emit(item.id, 0.0)
                 self.item_status_changed.emit(item.id, ItemStatus.PENDING.value)
         if self._is_running:
             self._dispatch_next()
@@ -396,7 +484,7 @@ class BatchDownloadManager(QObject):
 
     def _pump_info_queue(self) -> None:
         """上限に達するまで、待機中のタイトル取得を開始する。"""
-        while self._info_queue and len(self._info_workers) < self.MAX_INFO_WORKERS:
+        while not self._closing and self._info_queue and len(self._info_workers) < self.MAX_INFO_WORKERS:
             item_id, url = self._info_queue.pop(0)
             # 待機中に削除されたアイテムはスキップ
             if self.find_item_by_id(item_id) is None:
@@ -407,11 +495,12 @@ class BatchDownloadManager(QObject):
             worker = _InfoWorker(item_id, url, self)
             worker.info_fetched.connect(self._on_info_fetched)
             worker.info_failed.connect(self._on_info_failed)
-            worker.finished.connect(lambda wid=item_id: self._cleanup_info_worker(wid))
+            worker.finished.connect(self._cleanup_info_worker)
             self._info_workers[item_id] = worker
             worker.start()
 
-    def _cleanup_info_worker(self, item_id: str) -> None:
+    @Slot()
+    def _cleanup_info_worker(self) -> None:
         """情報取得ワーカーをクリーンアップする。
 
         バッチ実行中にタイトル取得が完了した場合、この時点でアイテムは
@@ -420,7 +509,8 @@ class BatchDownloadManager(QObject):
         アイテムが途中で削除されていた場合も、ここを通ることで
         「RESOLVING待ちのまま止まる」状態を防げる。
         """
-        worker = self._info_workers.pop(item_id, None)
+        sender = self.sender()
+        worker = self._info_workers.pop(sender.item_id, None)
         if worker:
             worker.deleteLater()
         # 空いた枠で待機中の取得を開始する
@@ -445,6 +535,10 @@ class BatchDownloadManager(QObject):
                 item.duration = f"{minutes}:{seconds:02d}"
         
         item.filesize = info.get("filesize")
+        item.filesize_bytes = info.get("filesize_bytes")
+        item.uploader = info.get("uploader", "")
+        item.thumbnail_url = info.get("thumbnail", "")
+        self.item_metadata_changed.emit(item_id)
         if item.status == ItemStatus.RESOLVING:
             item.status = ItemStatus.PENDING
             self.item_status_changed.emit(item_id, ItemStatus.PENDING.value)
@@ -473,13 +567,13 @@ class BatchDownloadManager(QObject):
         # タイトル取得中のアイテムが残っている間は「完了」と判定しない。
         # 情報取得が終われば PENDING に遷移し、_cleanup_info_worker から
         # 再度 _dispatch_next が呼ばれてダウンロードが始まる。
-        if self.resolving_count > 0:
+        if self.resolving_count > 0 or self.expanding_count > 0:
             return
 
         # 全ワーカーが終了していてペンディングもない場合、完了通知
         if not self._active_workers and self._find_next_pending() is None:
             self._is_running = False
-            self.all_finished.emit(self.completed_count, self.failed_count)
+            self.all_finished.emit(self.completed_count, self.failed_count + len(self._expansion_errors))
 
     def _find_next_pending(self) -> Optional[DownloadItem]:
         """次の待機中アイテムを返す。"""
@@ -508,6 +602,7 @@ class BatchDownloadManager(QObject):
         worker.progress.connect(self._on_worker_progress)
         worker.status_changed.connect(self._on_worker_status)
         worker.finished_item.connect(self._on_worker_finished)
+        worker.finished.connect(self._cleanup_download_worker)
         self._active_workers[item_id] = worker
 
         item.status = ItemStatus.DOWNLOADING
@@ -519,26 +614,29 @@ class BatchDownloadManager(QObject):
         worker = self._active_workers.get(item_id)
         if worker:
             worker.cancel()
-            # ワーカーの終了は finished_item シグナルで処理
+            # 結果通知とスレッド終了後の解放は別々に処理する
 
     @Slot(str, dict)
     def _on_worker_progress(self, item_id: str, data: dict) -> None:
         """ワーカーの進捗更新。"""
-        if data.get("status") == "downloading":
+        item = self.find_item_by_id(item_id)
+        if item is None or data.get('status') not in ('downloading', 'finished'):
+            return
+        item.record_transfer(data)
+        total = data.get('total_bytes') or data.get('total_bytes_estimate')
+        received = data.get('downloaded_bytes')
+        if data.get('status') == 'finished':
+            percent = 100.0
+        elif isinstance(total, (int, float)) and total > 0 and isinstance(received, (int, float)):
+            percent = received / total * 100
+        else:
             try:
-                p_str = data.get("_percent_str", "0%").replace("%", "")
-                percent = float(p_str)
-                item = self.find_item_by_id(item_id)
-                if item:
-                    item.progress = percent
-                    self.item_progress.emit(item_id, item.display_progress)
-            except ValueError:
-                pass
-        elif data.get("status") == "finished":
-            item = self.find_item_by_id(item_id)
-            if item:
-                item.progress = 100.0
-                self.item_progress.emit(item_id, item.display_progress)
+                percent = float(data.get('_percent_str', '0%').replace('%', '').strip())
+            except (ValueError, AttributeError):
+                percent = item.progress
+        item.update_progress(percent)
+        self.item_metadata_changed.emit(item_id)
+        self.item_progress.emit(item_id, item.display_progress)
 
     @Slot(str, str)
     def _on_worker_status(self, item_id: str, status: str) -> None:
@@ -550,17 +648,20 @@ class BatchDownloadManager(QObject):
 
     @Slot(str, bool, str)
     def _on_worker_finished(self, item_id: str, success: bool, message: str) -> None:
-        """ワーカーの完了処理。"""
-        worker = self._active_workers.pop(item_id, None)
-        if worker:
-            worker.deleteLater()
-
+        """結果を反映する。run() はまだ終了していないため解放しない。"""
         item = self.find_item_by_id(item_id)
         if item:
             if success:
                 item.status = ItemStatus.COMPLETED
                 item.progress = 100.0
                 item.filepath = message
+                try:
+                    item.filesize_bytes = Path(message).stat().st_size
+                    item.filesize = format_bytes(item.filesize_bytes)
+                except OSError:
+                    pass
+                item.phase = ''
+                self.item_metadata_changed.emit(item_id)
             else:
                 if "キャンセル" in message:
                     item.status = ItemStatus.CANCELLED
@@ -571,21 +672,48 @@ class BatchDownloadManager(QObject):
 
         self.item_finished.emit(item_id, success, message)
 
-        # 次のアイテムをディスパッチ
+    @Slot()
+    def _cleanup_download_worker(self) -> None:
+        """QThread.finished 後に解放し、空いた枠で次の処理を開始する。"""
+        worker = self.sender()
+        if not isinstance(worker, _SingleWorker):
+            return
+        if self._active_workers.get(worker.item_id) is worker:
+            del self._active_workers[worker.item_id]
+        worker.deleteLater()
         self._dispatch_next()
+        self.queue_changed.emit()
 
     @Slot(list)
     def _on_playlist_expanded(self, urls: list) -> None:
-        """プレイリスト展開完了時の処理。"""
-        self.add_urls(urls)
+        worker = self.sender()
+        if self._closing or worker.generation != self._generation:
+            return
+        valid = []
+        for url in urls:
+            try:
+                normalized, kind = classify_url(url)
+                if kind == 'video':
+                    valid.append(normalized)
+            except ValueError:
+                pass
+        self.add_urls(valid)
+        outcome = 'success' if valid else 'empty'
+        message = f'{len(valid)} 件の動画を展開しました' if valid else '動画が見つかりませんでした'
+        if not valid:
+            self._expansion_errors[worker.playlist_url] = message
+        self.expansion_result.emit(worker.operation_id, worker.playlist_url, outcome, message)
 
     @Slot(str)
     def _on_playlist_expand_failed(self, error: str) -> None:
-        """プレイリスト展開失敗時の処理。"""
-        logger.error("Playlist expansion failed: %s", error)
+        worker = self.sender()
+        if self._closing or worker.generation != self._generation:
+            return
+        self._expansion_errors[worker.playlist_url] = error
+        self.expansion_result.emit(worker.operation_id, worker.playlist_url, 'failed', error)
 
 
-class _PlaylistExpandWorker(QThread):
+class _PlaylistExpandWorker(CancellableWorker):
     """プレイリストURLから個別の動画URLを抽出するワーカー。"""
     urls_extracted = Signal(list)
     expand_failed = Signal(str)
@@ -597,7 +725,7 @@ class _PlaylistExpandWorker(QThread):
 
     def run(self):
         try:
-            urls = self._downloader.extract_playlist_urls(self.playlist_url)
+            urls = self._downloader.extract_playlist_urls(self.playlist_url, self.is_cancelled)
             self.urls_extracted.emit(urls)
         except Exception as e:
             logger.error("Playlist extraction error: %s", e)

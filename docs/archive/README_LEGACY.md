@@ -1,3 +1,5 @@
+> 過去の要件・検討履歴です。現行の操作方法は [ユーザーマニュアル](../user/USER_MANUAL.md) を参照してください。
+
 # YouTube Downloader for macOS
 
 ## 概要

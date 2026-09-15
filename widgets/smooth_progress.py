@@ -16,7 +16,7 @@ class SmoothProgressBar(QWidget):
         self._radius = 3
         # デフォルトカラー
         self._color1 = QColor(Theme.ACCENT)
-        self._color2 = QColor(Theme.ACCENT_LIGHT)
+        self._color2 = QColor(Theme.ACCENT)
         
         self.anim_timer = QTimer(self)
         self.anim_timer.timeout.connect(self._update_frame)
@@ -34,15 +34,15 @@ class SmoothProgressBar(QWidget):
 
     def setProgress(self, percent: float):
         """0.0 〜 1.0 の間で進捗をセットする"""
-        self._target_progress = percent
+        self._target_progress = max(0.0, min(1.0, percent))
         if not self.anim_timer.isActive():
             self.anim_timer.start(16)  # 60fps
             
     def setProgressImmediate(self, percent: float):
         """アニメーションなしで即座に進捗をセットする"""
-        self._target_progress = percent
-        self._current_progress = percent
-        if self.anim_timer.isActive() and percent >= 1.0:
+        self._target_progress = max(0.0, min(1.0, percent))
+        self._current_progress = self._target_progress
+        if self.anim_timer.isActive():
             self.anim_timer.stop()
         self.update()
 
@@ -66,8 +66,7 @@ class SmoothProgressBar(QWidget):
         else:
             self._current_progress = self._target_progress
             self.update()
-            if self._current_progress >= 1.0 or self._current_progress <= 0:
-                self.anim_timer.stop()
+            self.anim_timer.stop()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -75,7 +74,7 @@ class SmoothProgressBar(QWidget):
         
         # 背景（トラック）
         painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(Theme.INPUT_BG))
+        painter.setBrush(QColor(Theme.TRACK))
         painter.drawRoundedRect(self.rect(), self._radius, self._radius)
         
         # 進捗（チャンク）

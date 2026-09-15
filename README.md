@@ -17,7 +17,7 @@ macOSのネイティブ体験を重視し、PySide6 (Qt) で構築された高�
     - **音声**: MP3 (320/256/192/128kbps) および WAV 形式への変換。
 - **インテリジェントなURL処理**: 
     - `www` / `m` (モバイル) / `music` の各サブドメインに対応。
-    - 日本語などの非英数文字を含むURLをペーストした際、ブラウザによるエンコード（%記号の羅列）を検知し、自動的に元の日本語に戻して表示。
+    - 全入力経路でYouTubeホストを検証し、スキーム省略はHTTPSで補完。%エンコードを保持し、URLの意味を変えません。
 - **エンジンの更新**: 
     - ソースから起動した場合、起動時に `yt-dlp` の更新をバックグラウンドで確認します。
     - **`.app` 版は自己更新できません**（yt-dlp がアプリ内に固められているため）。エンジンが古くなると起動時に警告が出るので、[エンジンの更新](#エンジンの更新) の手順で再ビルドしてください。
@@ -44,7 +44,7 @@ macOSのネイティブ体験を重視し、PySide6 (Qt) で構築された高�
 
 ## 利用方法
 ### 起動方法
-- **アプリとして起動 (推奨)**: `YoutubeDownloader.app` をダブルクリックします。
+- **アプリとして起動 (推奨)**: `/Applications/YoutubeDownloader.app` をダブルクリックします（配置済みの利用先）。
 - **ターミナル起動 (開発時)**:
   ```bash
   source .venv/bin/activate
@@ -62,7 +62,8 @@ macOSのネイティブ体験を重視し、PySide6 (Qt) で構築された高�
     - デフォルトは `Downloads` フォルダです。必要に応じて「変更」ボタンから指定してください。
 4. **ダウンロードの実行**:
     - 「ダウンロード開始」ボタン、またはショートカットキー `⌘ + ⏎ (Cmd + Return)` で処理を開始します。
-    - ダウンロード中は「全て停止」ボタンでいつでも中断可能です。
+    - ダウンロード中は「全て停止」で中断を要求できます。通信・変換が終わるまで停止処理中の表示になります。
+    - 同名ファイルは連番で保存し、既存ファイルを上書きしません。終了時は全バックグラウンド処理の終了を待ちます。
 
 ### ログとメンテナンス
 - アプリケーションの動作ログは以下に出力されます。問題が発生した際はこちらを確認してください：
@@ -70,17 +71,16 @@ macOSのネイティブ体験を重視し、PySide6 (Qt) で構築された高�
 
 ## エンジンの更新
 
-`yt-dlp` は YouTube の仕様変更に追随するため頻繁に更新されます。**古いままだと全ての
-ダウンロードが `HTTP Error 403: Forbidden` で失敗します。** `.app` 版はエンジンを
+`yt-dlp` は YouTube の仕様変更に追随するため頻繁に更新されます。古いエンジンは `HTTP Error 403: Forbidden` などの失敗原因になります。 `.app` 版はエンジンを
 自己更新できないため、その場合は更新して再ビルドしてください。
 
 ```bash
-.venv/bin/pip install --upgrade yt-dlp
-.venv/bin/pyinstaller YoutubeDownloader.spec --noconfirm
+./scripts/update-and-install.sh
 ```
 
-ビルドした `.app` は `dist/` に出力されます。`/Applications` などに配置している場合は、
-そちらも差し替えてください。
+このコマンドは yt-dlp を更新し、専用の一時領域でビルド・署名検証後、`/Applications/YoutubeDownloader.app` へ配置します。旧版は `dist/backups/` に保存します。失敗時には既存アプリを保持・復旧します。初回配置後は、その利用先から起動してください。
+
+既存環境で更新せずビルドだけ確認する場合は `./scripts/update-and-install.sh --skip-update --build-only`。詳しい手順と復旧方法は [ビルドと更新](docs/development/build_and_update.md) を参照してください。
 
 > **注意**: プロジェクトが iCloud 同期対象のフォルダ（デスクトップ・書類など）にある場合、
 > ファイルプロバイダが付与する拡張属性により `codesign` が
@@ -92,17 +92,22 @@ macOSのネイティブ体験を重視し、PySide6 (Qt) で構築された高�
 > ```
 
 ## トラブルシューティング
-- **`403 Forbidden` で失敗する / 全ての動画が落とせない**: エンジンが古いのが原因です。
+- **`403 Forbidden` で失敗する / 全ての動画が落とせない**: エンジンの古さは原因の一つです。
   [エンジンの更新](#エンジンの更新) を実行してください。最も頻度の高い不具合です。
+- **「Sign in to confirm you’re not a bot」で全ての動画が落とせない**: 短時間に大量にダウンロードすると、
+  YouTubeに回線単位でボットと判定されます。アプリはこれを検出すると、自動で **Chrome の cookie** を使って
+  再試行します。初回は macOS のキーチェーン確認（「Chrome Safe Storage」）で「常に許可」を選んでください。
+  前提として、Chrome で YouTube にログインしていることと、node（`brew install node`）が必要です。
+  cookie を使っても解除されない場合は、時間をおいてから再試行してください。
 - **インストールが止まる**: インターネット接続を確認し、`pip install` を再度実行してください。
 - **音声変換ができない**: FFmpegがパスに通っているか確認してください（`ffmpeg -version` がターミナルで動く必要があります）。未検出の場合は起動時に警告が出ます。
 - **特定の動画だけ落とせない**: 削除済み・非公開・メンバー限定・地域制限などの可能性があります。
   キューの該当項目に理由が表示されます（全文はマウスオーバーで確認できます）。
 
 ## 開発・設計資料
-- **ユーザーマニュアル**: 操作方法の詳細は [docs/USER_MANUAL.md](docs/USER_MANUAL.md) を参照してください。
-- **テスト**: [docs/testing.md](docs/testing.md) に手動テスト項目と自動テスト方針をまとめています。
-- **UIスタディ**: プログレスバーのアニメーションや設計思想については [docs/progress_bar_animation_study.md](docs/progress_bar_animation_study.md) を参照してください。
+- **ユーザーマニュアル**: 操作方法の詳細は [docs/user/USER_MANUAL.md](docs/user/USER_MANUAL.md) を参照してください。
+- **テスト**: [docs/development/testing.md](docs/development/testing.md) に手動テスト項目と自動テスト方針をまとめています。
+- **UIスタディ**: プログレスバーのアニメーションや設計思想については [docs/archive/progress_bar_animation_study.md](docs/archive/progress_bar_animation_study.md) を参照してください。
 
 ---
-*旧バージョンのREADME（Tkinter版等）は [README_LEGACY.md](README_LEGACY.md) として保管されています。*
+*旧バージョンのREADME（Tkinter版等）は [docs/archive/README_LEGACY.md](docs/archive/README_LEGACY.md) として保管されています。*

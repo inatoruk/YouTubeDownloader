@@ -7,8 +7,9 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -211,7 +212,7 @@ class Downloader:
 
     def _base_options(self) -> dict:
         """全ての yt-dlp 呼び出しに共通するオプション。"""
-        options: dict = {"quiet": True, "no_warnings": True, "no_color": True}
+        options: dict = {"quiet": True, "no_warnings": True, "no_color": True, "socket_timeout": 15}
         if Downloader._cookies_enabled:
             options.update(self._cookie_options())
         return options
@@ -241,18 +242,21 @@ class Downloader:
                 COOKIE_BROWSER,
             )
 
-    def _extract(self, url: str, extra: dict, handle: Callable[[Optional[dict]], object]):
+    def _extract(self, url: str, extra: dict, handle: Callable[[Optional[dict]], object], is_cancelled=None):
         """ダウンロードせずに情報を取得し、handle(info) の結果を返す。
 
         ボット検出を受けたら cookie 経路で1度だけやり直す。handle は yt-dlp の
         セッションが開いている間に呼ぶ（従来どおり with ブロック内で処理する）。
         """
         for _ in range(2):
+            self._check_cancelled(is_cancelled)
             used_cookies = Downloader._cookies_enabled
             options = {**self._base_options(), **extra}
             try:
                 with yt_dlp.YoutubeDL(options) as ydl:
-                    return handle(ydl.extract_info(url, download=False))
+                    info = ydl.extract_info(url, download=False)
+                    self._check_cancelled(is_cancelled)
+                    return handle(info)
             except Exception as exc:
                 if is_bot_check_error(str(exc)) and not used_cookies:
                     self._enable_cookies()
@@ -261,6 +265,47 @@ class Downloader:
         return None
 
     def download(
+        self,
+        request: DownloadRequest,
+        progress_hooks: Optional[Sequence[ProgressCallback]] = None,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> str:
+        """専用の作業フォルダで取得し、完成したファイルだけ保存先へ移す。
+
+        中断・失敗時は、このダウンロードの途中ファイルだけを削除する。
+        既存ファイルや並列ダウンロードの作業ファイルには触れない。
+        """
+        if is_cancelled and is_cancelled():
+            raise DownloadCancelled("キャンセルされました")
+        output_dir = Path(request.output_path).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".youtube-download-", dir=output_dir) as work_dir:
+            completed = Path(self._download_to_directory(
+                replace(request, output_path=work_dir), progress_hooks, is_cancelled,
+            ))
+            # 変換・結合中の停止要求も、完成ファイルを保存する前に反映する。
+            if is_cancelled and is_cancelled():
+                raise DownloadCancelled("キャンセルされました")
+            number = 1
+            while True:
+                name = completed.name if number == 1 else f"{completed.stem} ({number}){completed.suffix}"
+                destination = output_dir / name
+                try:
+                    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+                    break
+                except FileExistsError:
+                    number += 1
+            os.close(fd)
+            try:
+                self._check_cancelled(is_cancelled)
+                os.replace(completed, destination)
+            except BaseException:
+                destination.unlink(missing_ok=True)
+                raise
+        self._logger.info("Download saved: %s", destination)
+        return str(destination)
+
+    def _download_to_directory(
         self,
         request: DownloadRequest,
         progress_hooks: Optional[Sequence[ProgressCallback]] = None,
@@ -305,15 +350,14 @@ class Downloader:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(request.url, download=True)
                     if info:
-                        # ダウンロードしたファイルのパスを取得
-                        if request.format_type == "audio":
-                            ext = request.audio_format.lower()
-                        else:
-                            ext = "mp4"
-                        filename = ydl.prepare_filename(info)
-                        # 拡張子を正しいものに置換
-                        final_path = Path(filename).with_suffix(f".{ext}")
-                        self._logger.info("Download completed: %s", final_path)
+                        downloads = info.get("requested_downloads") or [info]
+                        if len(downloads) != 1:
+                            raise DownloadError("単一動画の完成ファイルを確認できませんでした")
+                        final_path = Path(downloads[0].get("filepath") or "")
+                        expected_ext = request.audio_format.lower() if request.format_type == "audio" else "mp4"
+                        if (not final_path.is_file() or final_path.suffix.lower() != f".{expected_ext}"
+                                or not final_path.resolve().is_relative_to(output_dir.resolve())):
+                            raise DownloadError("変換後の完成ファイルを確認できませんでした")
                         return str(final_path)
                 raise DownloadError(f"ダウンロード情報の取得に失敗しました: {request.url}")
             except DownloadCancelled:
@@ -347,13 +391,21 @@ class Downloader:
                 if attempt < self._max_retries:
                     sleep_seconds = min(5, attempt)
                     self._logger.info("Retrying in %s seconds", sleep_seconds)
-                    time.sleep(sleep_seconds)
+                    deadline = time.monotonic() + sleep_seconds
+                    while time.monotonic() < deadline:
+                        self._check_cancelled(is_cancelled)
+                        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
         raise DownloadError(
             describe_error(str(last_error), cookies_used=last_used_cookies)
         ) from last_error
 
-    def fetch_info(self, url: str) -> Optional[dict]:
+    @staticmethod
+    def _check_cancelled(is_cancelled):
+        if is_cancelled and is_cancelled():
+            raise DownloadCancelled("キャンセルされました")
+
+    def fetch_info(self, url: str, is_cancelled=None) -> Optional[dict]:
         """動画の情報をダウンロードせずに取得する。
 
         Returns:
@@ -370,10 +422,13 @@ class Downloader:
                 "uploader": info.get("uploader", ""),
                 "view_count": info.get("view_count"),
                 "filesize": self._format_filesize(info.get("filesize") or info.get("filesize_approx")),
+                "filesize_bytes": info.get("filesize") or info.get("filesize_approx"),
             }
 
         try:
-            return self._extract(url, {"noplaylist": True, "skip_download": True}, summarize)
+            return self._extract(url, {"noplaylist": True, "skip_download": True}, summarize, is_cancelled)
+        except DownloadCancelled:
+            raise
         except Exception as exc:
             self._logger.warning("Info fetch failed for %s: %s", url, exc)
         return None
@@ -388,7 +443,7 @@ class Downloader:
             size /= 1024.0
         return f"{size:.1f} PB"
 
-    def extract_channel_urls(self, channel_url: str) -> list[str]:
+    def extract_channel_urls(self, channel_url: str, is_cancelled=None) -> list[str]:
         """チャンネルURLから全動画URLのリストを抽出する。
 
         yt-dlpの extract_flat を使い、チャンネル内の全エントリを取得する。
@@ -401,11 +456,13 @@ class Downloader:
         def collect(info: Optional[dict]) -> None:
             if info and "entries" in info:
                 for entry in info["entries"]:
+                    self._check_cancelled(is_cancelled)
                     if entry is None:
                         continue
                     # ネストされたプレイリスト（チャンネルの「動画」タブなど）を再帰的に展開
                     if "entries" in entry:
                         for sub_entry in entry["entries"]:
+                            self._check_cancelled(is_cancelled)
                             if sub_entry and sub_entry.get("url"):
                                 video_url = sub_entry["url"]
                                 if not video_url.startswith("http"):
@@ -423,13 +480,15 @@ class Downloader:
                 urls.append(info["webpage_url"])
 
         try:
-            self._extract(channel_url, {"extract_flat": "in_playlist", "noplaylist": False}, collect)
+            self._extract(channel_url, {"extract_flat": "in_playlist", "noplaylist": False, "lazy_playlist": True}, collect, is_cancelled)
+        except DownloadCancelled:
+            raise
         except Exception as exc:
             self._logger.error("Channel extraction failed: %s", exc)
             raise DownloadError(f"チャンネルの展開に失敗しました: {channel_url}") from exc
         return urls
 
-    def extract_playlist_urls(self, playlist_url: str) -> list[str]:
+    def extract_playlist_urls(self, playlist_url: str, is_cancelled=None) -> list[str]:
         """プレイリストURLから個別の動画URLリストを抽出する。
 
         Returns:
@@ -440,6 +499,7 @@ class Downloader:
         def collect(info: Optional[dict]) -> None:
             if info and "entries" in info:
                 for entry in info["entries"]:
+                    self._check_cancelled(is_cancelled)
                     if entry and entry.get("url"):
                         video_url = entry["url"]
                         # フルURLに変換
@@ -454,7 +514,9 @@ class Downloader:
                 urls.append(info["webpage_url"])
 
         try:
-            self._extract(playlist_url, {"extract_flat": "in_playlist", "noplaylist": False}, collect)
+            self._extract(playlist_url, {"extract_flat": "in_playlist", "noplaylist": False, "lazy_playlist": True}, collect, is_cancelled)
+        except DownloadCancelled:
+            raise
         except Exception as exc:
             self._logger.error("Playlist extraction failed: %s", exc)
             raise DownloadError(f"プレイリストの展開に失敗しました: {playlist_url}") from exc
@@ -543,6 +605,7 @@ class Downloader:
             format_selector = self._build_format_selector(request.resolution)
             options["format"] = format_selector
             options["merge_output_format"] = "mp4"
+            options["postprocessors"] = [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]
 
         # js_runtimes / remote_components は Python API でも有効なパラメータ。
         # 通常は cookie なしの既定クライアントで十分なため指定せず、

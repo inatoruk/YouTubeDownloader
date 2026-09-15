@@ -17,3 +17,11 @@ dist/
 
 # Logs
 *.log
+
+# 手動削除待ちの隔離ファイル
+/削除候補_2026-09-09/
+
+# ローカル生成レポート
+/folder-map.html
+/folder-map-organized.html
+/organization-report.html

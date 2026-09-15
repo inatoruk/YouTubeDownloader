@@ -9,7 +9,6 @@ from __future__ import annotations
 import sys
 import os
 import logging
-import re
 from typing import Optional
 
 from PySide6.QtWidgets import (
@@ -17,9 +16,9 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea,
     QFileDialog, QMessageBox,
 )
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QEvent, QUrl, QTranslator, QLibraryInfo
+from PySide6.QtCore import Qt, Slot, QEvent, QUrl, QTranslator, QLibraryInfo, QTimer
 from PySide6.QtGui import (
-    QColor, QPalette, QKeySequence, QShortcut, QDesktopServices,
+    QColor, QPalette, QKeySequence, QShortcut, QDesktopServices, QFontDatabase, QFont, QFontInfo,
 )
 
 from downloader import (
@@ -28,7 +27,11 @@ from downloader import (
 )
 from queue_manager import BatchDownloadManager, DownloadItem, ItemStatus
 from theme import Theme, build_global_stylesheet
+from utils.worker import CancellableWorker
+from utils.urls import classify_url
 from widgets import UrlInputPanel, QueuePanel, FormatPanel, ProgressPanel
+from widgets.surfaces import SidebarSurface, install_focus_style
+from widgets.queue_panel import ElidedLabel
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +39,13 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # yt-dlp 更新ワーカー
 # =============================================================================
-class _YtDlpUpdateWorker(QThread):
+class _YtDlpUpdateWorker(CancellableWorker):
     """起動時にバックグラウンドで yt-dlp の更新を確認するワーカー。"""
 
     def run(self):
         try:
-            Downloader()._ensure_updated()
+            if not self.is_cancelled():
+                Downloader()._ensure_updated()
         except Exception as exc:
             logger.warning("バックグラウンド更新チェックに失敗しました: %s", exc)
 
@@ -56,29 +60,41 @@ class MainWindow(QMainWindow):
     ここではパネル同士とBatchDownloadManagerの接続（オーケストレーション）のみ行う。
     """
 
-    # コンテンツ列の最大幅。全画面表示でカードが横に間延びしないよう、
-    # これ以上は広げずに中央寄せする。
-    MAX_CONTENT_WIDTH = 900
-
     def __init__(self):
         super().__init__()
+        install_focus_style()
         self.setWindowTitle("YouTube Downloader")
-        self.resize(720, 750)
+        font = QFontDatabase.systemFont(QFontDatabase.GeneralFont)
+        font.setFamily(QFontInfo(font).family())
+        font.setStyleStrategy(QFont.PreferAntialias)
+        self.setFont(font)
+        self.resize(1200, 820)
+        self.setMinimumSize(800, 600)
 
         # バッチマネージャー
         self._batch_manager = BatchDownloadManager(max_concurrent=2)
+        self._closing = False
+        self._stopping = False
+        self._update_worker = None
+        self._shutdown_timer = QTimer(self)
+        self._shutdown_timer.setInterval(50)
+        self._shutdown_timer.timeout.connect(self._finish_close)
 
+        Theme.configure(QApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark)
         self._apply_palette()
         self._build_ui()
         self._setup_shortcuts()
         self._connect_signals()
+        QApplication.styleHints().colorSchemeChanged.connect(self._on_color_scheme)
+        self._sync_ui_state()
+        self.url_panel.url_input.setFocus(Qt.OtherFocusReason)
 
     # =========================================================================
     # 初期化
     # =========================================================================
 
     def _apply_palette(self):
-        """ダークテーマのパレットとグローバルスタイルシートを適用する。"""
+        """現在の外観に合わせてパレットとスタイルを適用する。"""
         p = self.palette()
         p.setColor(QPalette.Window, QColor(Theme.BG_DARK))
         p.setColor(QPalette.WindowText, QColor(Theme.TEXT_PRIMARY))
@@ -99,142 +115,114 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         """UIを構築する。各セクションはパネルウィジェットに委譲。"""
         central = QWidget()
+        central.setObjectName("Workspace")
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        # ウィンドウを広げてもコンテンツは MAX_CONTENT_WIDTH で頭打ちにし、
-        # 余った横幅は左右の余白として中央に寄せる。
-        # （setWidgetResizable(True) はウィジェットの最大幅制約を尊重する）
-        scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
-
+        shell = QHBoxLayout(central)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+        sidebar = SidebarSurface()
+        self.sidebar = sidebar
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(264)
+        left = QVBoxLayout(sidebar)
+        left.setContentsMargins(20, 28, 20, 24)
+        left.setSpacing(28)
+        self.format_panel = FormatPanel()
+        left.addWidget(self.format_panel)
+        self._build_output_card(left)
+        left.addStretch()
+        shell.addWidget(sidebar)
         content = QWidget()
-        content.setMaximumWidth(self.MAX_CONTENT_WIDTH)
-        scroll.setWidget(content)
-
         layout = QVBoxLayout(content)
+        layout.setContentsMargins(28, 28, 28, 18)
         layout.setSpacing(20)
-        layout.setContentsMargins(24, 24, 24, 24)
-
-        # 1. ヘッダー
-        self._build_header(layout)
-
-        # 2. URL入力パネル
         self.url_panel = UrlInputPanel()
         layout.addWidget(self.url_panel)
-
-        # 3. キューパネル
         self.queue_panel = QueuePanel()
-        layout.addWidget(self.queue_panel)
-
-        # 4. 形式パネル
-        self.format_panel = FormatPanel()
-        layout.addWidget(self.format_panel)
-
-        # 5. 保存先
-        self._build_output_card(layout)
-
-        # 6. 進捗パネル
+        layout.addWidget(self.queue_panel, 1)
         self.progress_panel = ProgressPanel()
         layout.addWidget(self.progress_panel)
-
-        # 7. 操作ボタン
         self._build_control_card(layout)
+        shell.addWidget(content, 1)
 
-        layout.addStretch()
-        main_layout.addWidget(scroll)
-
-    def _build_header(self, parent_layout: QVBoxLayout):
-        """ヘッダー部分を構築する。"""
-        header = QWidget()
-        header_layout = QVBoxLayout(header)
-        header_layout.setContentsMargins(0, 0, 0, 16)
-        header_layout.setSpacing(4)
-
-        title = QLabel("YouTube Downloader")
-        title.setStyleSheet(f"""
-            font-size: 28px; font-weight: 700;
-            color: {Theme.TEXT_PRIMARY}; background: transparent;
-        """)
-
-        subtitle = QLabel("動画・音声を高品質でダウンロード — 一括対応")
-        subtitle.setStyleSheet(f"""
-            font-size: 14px; font-weight: 400;
-            color: {Theme.TEXT_SECONDARY}; background: transparent;
-        """)
-
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
-        parent_layout.addWidget(header)
+    def _on_color_scheme(self, scheme):
+        Theme.configure(scheme == Qt.ColorScheme.Dark)
+        self._apply_palette()
+        self.queue_panel.refresh_theme()
+        self.progress_panel.refresh_theme()
+        self.sidebar.update()
 
     def _build_output_card(self, parent_layout: QVBoxLayout):
         """保存先カードを構築する。"""
         card = QFrame()
-        card.setObjectName("Card")
+        self.output_card = card
+        card.setObjectName("OutputGroup")
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setContentsMargins(0, 22, 0, 0)
         layout.setSpacing(12)
 
         title = QLabel("保存先")
         title.setObjectName("Title")
         layout.addWidget(title)
 
-        row = QHBoxLayout()
-        self.output_edit = QLineEdit()
-        self.output_edit.setText(str(os.path.expanduser("~/Downloads")))
+        self.output_edit = QLineEdit(card)
         self.output_edit.setReadOnly(True)
-        self.output_edit.setCursor(Qt.PointingHandCursor)
-        self.output_edit.installEventFilter(self)
-
-        change_btn = QPushButton("変更")
-        change_btn.setObjectName("secondary")
-        change_btn.setCursor(Qt.PointingHandCursor)
+        self.output_edit.hide()
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.folder_label = ElidedLabel()
+        self.folder_label.setAccessibleName("保存先")
+        row.addWidget(self.folder_label, 1)
+        change_btn = QPushButton("変更…")
+        change_btn.setObjectName("link")
         change_btn.clicked.connect(self._on_browse)
-
-        row.addWidget(self.output_edit)
         row.addWidget(change_btn)
         layout.addLayout(row)
+        self.folder_path = ElidedLabel()
+        self.folder_path.setObjectName("Secondary")
+        layout.addWidget(self.folder_path)
+        self.output_edit.textChanged.connect(self._update_folder_display)
+        self.output_edit.setText(os.path.expanduser("~/Downloads"))
         parent_layout.addWidget(card)
 
-    def _build_control_card(self, parent_layout: QVBoxLayout):
-        """操作ボタンカードを構築する。"""
+    def _update_folder_display(self, path):
+        name = os.path.basename(path.rstrip(os.sep)) or path
+        self.folder_label.setText("ダウンロード" if path == os.path.expanduser("~/Downloads") else name)
+        self.folder_label.setToolTip(path)
+        home = os.path.expanduser("~")
+        self.folder_path.setText("~" + path[len(home):] if path.startswith(home + os.sep) else path)
+
+    def _build_control_card(self, parent_layout):
         card = QFrame()
-        card.setObjectName("Card")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-
-        title = QLabel("操作")
-        title.setObjectName("Title")
-        layout.addWidget(title)
-
-        row = QHBoxLayout()
-        row.addStretch()
-
+        card.setObjectName("Footer")
+        row = QHBoxLayout(card)
+        row.setContentsMargins(0, 16, 0, 0)
+        self.selection_summary = QLabel()
+        self.selection_summary.setObjectName("Secondary")
+        row.addWidget(self.selection_summary, 1)
         self.download_btn = QPushButton("ダウンロード開始")
-        self.download_btn.setMinimumHeight(44)
-        self.download_btn.setCursor(Qt.PointingHandCursor)
+        self.download_btn.setMinimumHeight(38)
         self.download_btn.clicked.connect(self._on_start_batch)
-
-        self.stop_btn = QPushButton("全て停止")
-        self.stop_btn.setObjectName("secondary")
-        self.stop_btn.setMinimumHeight(44)
-        self.stop_btn.setCursor(Qt.PointingHandCursor)
+        self.stop_btn = QPushButton("すべて停止")
+        self.stop_btn.setMinimumHeight(38)
         self.stop_btn.clicked.connect(self._on_stop_all)
-        self.stop_btn.setVisible(False)
-
-        close_btn = QPushButton("閉じる")
-        close_btn.setObjectName("secondary")
-        close_btn.setCursor(Qt.PointingHandCursor)
-        close_btn.clicked.connect(self.close)
-
+        self.stop_btn.hide()
         row.addWidget(self.download_btn)
         row.addWidget(self.stop_btn)
-        row.addWidget(close_btn)
-        layout.addLayout(row)
         parent_layout.addWidget(card)
+        for combo in (self.format_panel.resolution_combo, self.format_panel.format_combo,
+                      self.format_panel.bitrate_combo):
+            combo.currentTextChanged.connect(self._update_selection_summary)
+        self.format_panel.video_radio.toggled.connect(self._update_selection_summary)
+        self.output_edit.textChanged.connect(self._update_selection_summary)
+        self._update_selection_summary()
+
+    def _update_selection_summary(self, *_):
+        panel = self.format_panel
+        text = ("MP4 · " + panel.resolution_combo.currentText() if panel.get_format_type() == "video"
+                else panel.get_audio_format() + (" · " + panel.get_bitrate() if panel.get_audio_format() == "MP3" else ""))
+        self.selection_summary.setText(text)
+        self.selection_summary.setToolTip(self.output_edit.text())
 
     def _setup_shortcuts(self):
         """キーボードショートカットを設定する。"""
@@ -254,9 +242,10 @@ class MainWindow(QMainWindow):
         # URL パネル → マネージャー
         self.url_panel.url_submitted.connect(self._on_url_submitted)
         self.url_panel.bulk_urls_submitted.connect(self._on_bulk_urls_submitted)
-        self.url_panel.status_message.connect(
-            lambda msg, err: self.progress_panel.set_status(msg, err)
-        )
+        self.url_panel.status_message.connect(self._show_status)
+        self.url_panel.channel_confirmed.connect(self._intake_urls)
+        self.url_panel.state_changed.connect(self._sync_import_controls)
+        mgr.expansion_result.connect(self._on_expansion_result)
 
         # キューパネル → マネージャー
         self.queue_panel.remove_item.connect(self._on_remove_item)
@@ -273,36 +262,45 @@ class MainWindow(QMainWindow):
         mgr.item_finished.connect(self._on_item_finished)
         mgr.all_finished.connect(self._on_all_finished)
         mgr.queue_changed.connect(self._sync_ui_state)
+        mgr.item_metadata_changed.connect(self._on_item_metadata)
 
     # =========================================================================
     # URL パネルハンドラ
     # =========================================================================
 
-    def _on_url_submitted(self, url: str):
-        """単一URLが送信された時の処理。"""
-        from widgets.url_panel import UrlInputPanel
+    def _show_status(self, message, error=False):
+        if not self._closing:
+            self.progress_panel.set_status(message, error)
 
-        if UrlInputPanel._is_playlist_url(url):
+    def _on_expansion_result(self, operation_id, url, outcome, message):
+        self._show_status(f'{message} ({url})', outcome in ('failed', 'empty'))
+
+    def _on_url_submitted(self, url):
+        self._intake_urls([url])
+
+    def _on_bulk_urls_submitted(self, urls):
+        self._intake_urls(urls)
+
+    def _intake_urls(self, urls, auto_start=False):
+        if self._closing:
+            return
+        videos, playlists, channels, errors = [], [], [], []
+        for raw in urls:
+            try:
+                url, kind = classify_url(raw)
+                {'video': videos, 'playlist': playlists, 'channel': channels}[kind].append(url)
+            except ValueError as exc:
+                errors.append(f'{raw}: {exc}')
+        if videos:
+            self._batch_manager.add_urls(videos)
+        for url in playlists:
             self._batch_manager.add_playlist_items(url)
-            self.progress_panel.set_status("プレイリストを展開中...")
-        else:
-            self._batch_manager.add_urls([url])
-
-    def _on_bulk_urls_submitted(self, urls: list):
-        """一括URLが送信された時の処理。"""
-        from widgets.url_panel import UrlInputPanel
-
-        playlist_urls = [u for u in urls if UrlInputPanel._is_playlist_url(u)]
-        video_urls = [u for u in urls if not UrlInputPanel._is_playlist_url(u)]
-
-        if video_urls:
-            self._batch_manager.add_urls(video_urls)
-        for purl in playlist_urls:
-            self._batch_manager.add_playlist_items(purl)
-        if playlist_urls:
-            self.progress_panel.set_status(
-                f"{len(playlist_urls)} 件のプレイリストを展開中..."
-            )
+        for url in channels:
+            self.url_panel.request_channel(url, auto_start)
+        if auto_start and not self._batch_manager.is_running and (self._batch_manager.pending_count or self._batch_manager.expanding_count):
+            self._start_batch_download()
+        if errors:
+            self._show_status(f'{len(errors)} 件の無効なURL: ' + ' / '.join(errors), True)
 
     # =========================================================================
     # マネージャー → UI ハンドラ
@@ -321,6 +319,9 @@ class MainWindow(QMainWindow):
     @Slot(str, str)
     def _on_item_status_changed(self, item_id: str, status_value: str):
         self.queue_panel.update_item_status(item_id, ItemStatus(status_value))
+        item = self._batch_manager.find_item_by_id(item_id)
+        if item:
+            self.queue_panel.update_metadata(item)
         self._sync_ui_state()
 
     @Slot(str, str)
@@ -333,6 +334,13 @@ class MainWindow(QMainWindow):
             if item.filesize:
                 self.queue_panel.update_item_filesize(item_id, item.filesize)
 
+    @Slot(str)
+    def _on_item_metadata(self, item_id):
+        item = self._batch_manager.find_item_by_id(item_id)
+        if item:
+            self.queue_panel.update_metadata(item)
+            self._sync_ui_state()
+
     @Slot(str, bool, str)
     def _on_item_finished(self, item_id: str, success: bool, message: str):
         # 失敗理由をキュー上に表示する（従来は✕アイコンのみでログを見るしかなかった）
@@ -342,6 +350,9 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int)
     def _on_all_finished(self, success_count: int, fail_count: int):
+        if self._closing:
+            return
+        output_path = self._batch_manager.output_path
         self.download_btn.setEnabled(True)
         self.download_btn.setText("ダウンロード開始")
         self.stop_btn.setVisible(False)
@@ -358,15 +369,15 @@ class MainWindow(QMainWindow):
             msg_box.exec()
             if msg_box.clickedButton() == open_btn:
                 QDesktopServices.openUrl(
-                    QUrl.fromLocalFile(self.output_edit.text())
+                    QUrl.fromLocalFile(output_path)
                 )
         else:
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("ダウンロード結果")
             msg_box.setIcon(QMessageBox.NoIcon)
-            msg_box.setText(f"完了: {success_count} 件\n失敗: {fail_count} 件")
+            msg_box.setText(f"完了: {success_count} 件\n失敗（一覧取得を含む）: {fail_count} 件")
             msg_box.setInformativeText(
-                "失敗したアイテムは「失敗を再試行」ボタンでリトライできます。"
+                "動画は「失敗を再試行」、一覧取得は対象URLを再追加してください。"
             )
             msg_box.setStyleSheet("QLabel { min-width: 420px; }")
             msg_box.setStandardButtons(QMessageBox.Ok)
@@ -392,7 +403,7 @@ class MainWindow(QMainWindow):
             self._start_batch_download()
 
     def _on_clear_completed(self):
-        if self._batch_manager.is_running:
+        if self._batch_manager.is_running or self._stopping:
             self.progress_panel.set_status(
                 "ダウンロード中はクリアできません", is_error=True
             )
@@ -402,7 +413,7 @@ class MainWindow(QMainWindow):
         self._sync_ui_state()
 
     def _on_clear_all(self):
-        if self._batch_manager.is_running:
+        if self._batch_manager.is_running or self._stopping:
             self.progress_panel.set_status(
                 "ダウンロード中はクリアできません", is_error=True
             )
@@ -416,6 +427,7 @@ class MainWindow(QMainWindow):
         msg_box.setIcon(QMessageBox.NoIcon)
         msg_box.exec()
         if msg_box.clickedButton() == yes_btn:
+            self.url_panel.invalidate()
             self._batch_manager.clear_all()
             self.queue_panel.rebuild(self._batch_manager.items)
             self._sync_ui_state()
@@ -437,6 +449,8 @@ class MainWindow(QMainWindow):
 
     def _start_batch_download(self):
         """バッチダウンロードを開始するUI更新を行う。"""
+        if self._closing or self._stopping:
+            return
         base_req = self._build_base_request()
         resolving = self._batch_manager.resolving_count
 
@@ -452,46 +466,47 @@ class MainWindow(QMainWindow):
         else:
             self.progress_panel.set_status("ダウンロード中...")
         self._batch_manager.start_all(base_req)
+        self._sync_ui_state()
 
     def _on_start_batch(self):
         """「ダウンロード開始」ボタンのハンドラ。"""
         mgr = self._batch_manager
 
-        if mgr.total_count == 0:
+        if self._closing or self._stopping:
+            return
+        if mgr.total_count == 0 and not mgr.expanding_count:
             url = self.url_panel.url_input.text().strip()
             if not url:
-                self.progress_panel.set_status(
-                    "URLを入力するか、キューに追加してください", is_error=True
-                )
+                self._show_status('URLを入力するか、キューに追加してください', True)
                 return
-            from widgets.url_panel import UrlInputPanel
-            if not UrlInputPanel._validate_youtube_url(url):
-                self.progress_panel.set_status(
-                    "無効なURLです。YouTubeのURLを入力してください。", is_error=True
-                )
-                return
-            self._batch_manager.add_urls([url])
-            self.url_panel.url_input.clear()
-
-        if mgr.pending_count == 0:
-            self.progress_panel.set_status(
-                "ダウンロード待ちのアイテムがありません", is_error=True
-            )
+            self._intake_urls([url], True)
+            if self.url_panel._validate_youtube_url(url):
+                self.url_panel.url_input.clear()
+            return
+        if mgr.pending_count == 0 and not mgr.expanding_count:
+            self._show_status('ダウンロード待ちのアイテムがありません', True)
             return
 
         self._start_batch_download()
 
     def _on_stop_all(self):
         """「全て停止」ボタンのハンドラ。"""
+        self.url_panel.cancel_auto_start()
         self._batch_manager.stop_all()
-        self.download_btn.setEnabled(True)
-        self.download_btn.setText("ダウンロード開始")
-        self.stop_btn.setVisible(False)
-        self.progress_panel.set_status("ダウンロードを停止しました")
+        self._stopping = bool(self._batch_manager.active_download_count)
+        self._sync_ui_state()
+        self._show_status('ダウンロードの停止処理中...' if self._stopping else 'ダウンロードを停止しました')
 
     # =========================================================================
     # 状態更新ヘルパー
     # =========================================================================
+
+    def _sync_import_controls(self):
+        if self._closing:
+            return
+        manager = self._batch_manager
+        has_items = manager.total_count or manager.expanding_count or self.url_panel.busy
+        self.queue_panel.clear_all_btn.setEnabled(bool(has_items) and not manager.is_running and not self._stopping)
 
     def _sync_ui_state(self):
         """キューの現在の状態を元にUIを完全同期する。
@@ -499,7 +514,20 @@ class MainWindow(QMainWindow):
         進捗バー・件数・ステータス文言の全てをこのメソッド一つで正確に更新する。
         イベントハンドラ内では、このメソッドを呼ぶだけでよい。
         """
+        if self._closing:
+            return
         mgr = self._batch_manager
+        if self._stopping and not mgr.active_download_count:
+            self._stopping = False
+        locked = mgr.is_running or self._stopping
+        self.queue_panel.setEnabled(not self._stopping)
+        self.output_card.setEnabled(not locked)
+        self.format_panel.setEnabled(not locked)
+        self.download_btn.setEnabled(not locked)
+        self.download_btn.setText('停止処理中...' if self._stopping else 'ダウンロード中...' if mgr.is_running else 'ダウンロード開始')
+        self.stop_btn.setVisible(mgr.is_running or self._stopping)
+        self.stop_btn.setEnabled(not self._stopping)
+        self.download_btn.setVisible(not (mgr.is_running or self._stopping))
         total = mgr.total_count
 
         # 1. 全体進捗バーの更新
@@ -508,26 +536,37 @@ class MainWindow(QMainWindow):
         else:
             total_progress = sum(
                 100.0 if item.status == ItemStatus.COMPLETED else
-                item.display_progress if item.status == ItemStatus.DOWNLOADING else
+                item.display_progress if item.status in (ItemStatus.DOWNLOADING, ItemStatus.CANCELLED, ItemStatus.FAILED) else
                 0.0
                 for item in mgr.items
             )
             self.progress_panel.update_progress(
-                total_progress / total, mgr.completed_count, total
+                min(total_progress / total, 99.0) if mgr.completed_count != total or mgr.expanding_count or mgr.expansion_errors else 100.0, mgr.completed_count, total
             )
+
+        self.progress_panel.update_capacity(mgr.items)
 
         # 2. キューの件数表示
         self.queue_panel.update_counts(
             total=total,
             completed=mgr.completed_count,
             failed=mgr.failed_count,
-            is_running=mgr.is_running,
+            is_running=locked,
         )
 
+        self._sync_import_controls()
+
         # 3. ステータス文言の自動同期（DL中は上書きしない）
+        if self._stopping:
+            self.progress_panel.set_status("ダウンロードの停止処理中...")
+            return
         if mgr.is_running:
             return
-        if total == 0:
+        if mgr.expansion_errors:
+            self.progress_panel.set_status('一覧取得の失敗: ' + ' / '.join(f'{url}: {error}' for url, error in mgr.expansion_errors.items()), is_error=True)
+        elif mgr.expanding_count:
+            self.progress_panel.set_status(f'プレイリストを展開中... ({mgr.expanding_count}件)')
+        elif total == 0:
             self.progress_panel.set_status("待機中")
         elif mgr.completed_count == total:
             self.progress_panel.set_status("すべてのダウンロードが完了しました！")
@@ -558,13 +597,29 @@ class MainWindow(QMainWindow):
         if path:
             self.output_edit.setText(path)
 
+    def _finish_close(self):
+        update_busy = self._update_worker is not None and self._update_worker.isRunning()
+        if self._batch_manager.busy or self.url_panel.busy or update_busy:
+            return
+        self._shutdown_timer.stop()
+        self.close()
+
     def closeEvent(self, event):
-        """全スレッドを安全に終了させてからウィンドウを閉じる。"""
-        if self._batch_manager.is_running:
-            logger.info("アプリ終了: ダウンロードを停止してスレッド終了を待機中...")
-            self._batch_manager.stop_all()
-        self._batch_manager.wait_all_workers(timeout_ms=5000)
-        super().closeEvent(event)
+        if not self._closing:
+            self._closing = True
+            self._batch_manager.shutdown()
+            self.url_panel.shutdown()
+            self.queue_panel.shutdown()
+            if self._update_worker:
+                self._update_worker.cancel()
+            self.centralWidget().setEnabled(False)
+            self.progress_panel.set_status('処理の終了を待っています')
+        update_busy = self._update_worker is not None and self._update_worker.isRunning()
+        if self._batch_manager.busy or self.url_panel.busy or update_busy:
+            event.ignore()
+            self._shutdown_timer.start()
+        else:
+            event.accept()
 
 
 # =============================================================================
@@ -654,8 +709,8 @@ def run(missing_tools: Optional[list[str]] = None):
         app.installTranslator(translator)
 
     window = MainWindow()
-    _update_worker = _YtDlpUpdateWorker(window)
-    _update_worker.start()
+    window._update_worker = _YtDlpUpdateWorker(window)
+    window._update_worker.start()
     window.show()
 
     # ウィンドウ表示後に警告を出す（ダイアログが前面に来るように）

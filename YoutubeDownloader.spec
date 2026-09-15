@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('utils', 'utils'), ('widgets', 'widgets'), ('theme.py', '.'), ('queue_manager.py', '.'), ('downloader.py', '.'), ('qt_app.py', '.')],
+    datas=[],  # Python modules are collected by Analysis, not copied as data.
     hiddenimports=['yt_dlp', 'PySide6.QtCore', 'PySide6.QtWidgets', 'PySide6.QtGui'],
     hookspath=[],
     hooksconfig={},

@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QRadioButton, QButtonGroup, QComboBox, QFrame,
+    QPushButton, QButtonGroup, QComboBox, QFrame,
 )
 from PySide6.QtWidgets import QSizePolicy
 
 from theme import Theme
+from widgets.surfaces import AirComboBox, SegmentButton, AnimatedSegment
 
 
 class FormatPanel(QFrame):
@@ -25,75 +26,58 @@ class FormatPanel(QFrame):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-
-        title = QLabel("形式と品質")
+        title = QLabel("保存設定")
         title.setObjectName("Title")
         layout.addWidget(title)
-
-        # Video / Audio
-        type_layout = QHBoxLayout()
-        self.video_radio = QRadioButton("動画 (MP4)")
-        self.audio_radio = QRadioButton("音声 (MP3/WAV)")
+        segment = AnimatedSegment()
+        self.segment = segment
+        segment.setObjectName("Segment")
+        types = QHBoxLayout(segment)
+        types.setContentsMargins(3, 3, 3, 3)
+        types.setSpacing(3)
+        self.video_radio = SegmentButton("動画")
+        self.audio_radio = SegmentButton("音声")
+        for button in (self.video_radio, self.audio_radio):
+            button.setCheckable(True)
+            button.setObjectName("segmentOption")
         self.video_radio.setChecked(True)
-
-        self._type_group = QButtonGroup()
-        self._type_group.addButton(self.video_radio)
-        self._type_group.addButton(self.audio_radio)
-
-        type_layout.addWidget(self.video_radio)
-        type_layout.addWidget(self.audio_radio)
-        type_layout.addStretch()
-        layout.addLayout(type_layout)
-
-        # Video options
+        self._type_group = QButtonGroup(self)
+        for button in (self.video_radio, self.audio_radio):
+            self._type_group.addButton(button)
+            types.addWidget(button, 1)
+        segment.bind((self.video_radio, self.audio_radio))
+        layout.addWidget(segment)
         self._video_container = QWidget()
-        video_layout = QHBoxLayout(self._video_container)
-        video_layout.setContentsMargins(0, 0, 0, 0)
-        video_layout.setSpacing(12)
-
-        res_label = QLabel("解像度:")
-        res_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        video_layout.addWidget(res_label)
-        self.resolution_combo = QComboBox()
-        self.resolution_combo.addItems(
-            ["最高画質（自動）", "720p", "1080p", "1440p", "2160p"]
-        )
-        self.resolution_combo.setCurrentText("最高画質（自動）")
-        self.resolution_combo.setFixedWidth(170)
-        video_layout.addWidget(self.resolution_combo)
-        video_layout.addStretch()
+        video = QVBoxLayout(self._video_container)
+        video.setContentsMargins(0, 10, 0, 0)
+        video.setSpacing(7)
+        label = QLabel("画質")
+        label.setObjectName("Secondary")
+        video.addWidget(label)
+        self.resolution_combo = AirComboBox()
+        self.resolution_combo.addItems(["最高画質（自動）", "2160p", "1440p", "1080p", "720p"])
+        video.addWidget(self.resolution_combo)
         layout.addWidget(self._video_container)
-
-        # Audio options
         self._audio_container = QWidget()
-        audio_layout = QHBoxLayout(self._audio_container)
-        audio_layout.setContentsMargins(0, 0, 0, 0)
-        audio_layout.setSpacing(12)
-
-        fmt_label = QLabel("形式:")
-        fmt_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        audio_layout.addWidget(fmt_label)
-        self.format_combo = QComboBox()
+        audio = QVBoxLayout(self._audio_container)
+        audio.setContentsMargins(0, 10, 0, 0)
+        audio.setSpacing(7)
+        label = QLabel("音声形式")
+        label.setObjectName("Secondary")
+        audio.addWidget(label)
+        self.format_combo = AirComboBox()
         self.format_combo.addItems(["MP3", "WAV"])
-        self.format_combo.setCurrentText("MP3")
-        self.format_combo.setFixedWidth(100)
-
-        self._bitrate_label = QLabel("ビットレート:")
-        self._bitrate_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.bitrate_combo = QComboBox()
+        audio.addWidget(self.format_combo)
+        self._bitrate_label = QLabel("ビットレート")
+        self._bitrate_label.setObjectName("Secondary")
+        audio.addWidget(self._bitrate_label)
+        self.bitrate_combo = AirComboBox()
         self.bitrate_combo.addItems(["320kbps", "256kbps", "192kbps", "128kbps"])
-        self.bitrate_combo.setFixedWidth(120)
-
-        audio_layout.addWidget(self.format_combo)
-        audio_layout.addWidget(self._bitrate_label)
-        audio_layout.addWidget(self.bitrate_combo)
-        audio_layout.addStretch()
+        audio.addWidget(self.bitrate_combo)
         layout.addWidget(self._audio_container)
-
-        # Signals
-        self._type_group.buttonClicked.connect(self._update_visibility)
+        self.video_radio.toggled.connect(self._update_visibility)
         self.format_combo.currentTextChanged.connect(self._on_format_changed)
         self._update_visibility()
 
